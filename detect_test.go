@@ -38,7 +38,14 @@ func TestDetectorFindsVersionsAndCapabilities(t *testing.T) {
 	}
 	want := []Agent{
 		{Name: "claude", Binary: "claude", Path: "/fake/bin/claude", Found: true, Version: "2.1.251", Capabilities: CapabilityHooks},
-		{Name: "codex", Binary: "codex", Path: "/fake/bin/codex", Found: true, Version: "0.151.0", Capabilities: CapabilityHooks | CapabilityExternalMessageQueue},
+		{
+			Name: "codex", Binary: "codex", Path: "/fake/bin/codex", Found: true, Version: "0.151.0",
+			Capabilities: CapabilityHooks | CapabilityExternalMessageQueue,
+			ExternalMessageCommand: &ExternalMessageCommand{
+				Binary: "codex",
+				Args:   []string{"queue", "--thread", PlaceholderThreadID, "--message", PlaceholderMessage},
+			},
+		},
 		{Name: "pi", Binary: "pi", Path: "/fake/bin/pi", Found: true, Version: "0.84.4", Capabilities: CapabilityExtensions | CapabilityRPCMode},
 	}
 	if !reflect.DeepEqual(agents, want) {
@@ -69,8 +76,22 @@ func TestDetectorReportsMissingAgentWithoutError(t *testing.T) {
 	if agent.Found || agent.Path != "" || agent.Version != "" {
 		t.Fatalf("missing agent = %+v", agent)
 	}
-	if !agent.Capabilities.Has(CapabilityExternalMessageQueue) {
+	if !agent.Capabilities.Has(CapabilityExternalMessageQueue) || agent.ExternalMessageCommand == nil {
 		t.Fatal("missing Codex result lost its static capability description")
+	}
+}
+
+func TestExternalMessageCommandOnlyBuildsArgv(t *testing.T) {
+	command := ExternalMessageCommand{
+		Binary: "codex",
+		Args:   []string{"queue", "--thread", PlaceholderThreadID, "--message", PlaceholderMessage},
+	}
+	want := []string{"codex", "queue", "--thread", "thread-1", "--message", "hello world"}
+	if got := command.Command("thread-1", "hello world"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Command() = %v, want %v", got, want)
+	}
+	if got := command.Arguments("thread-1", "hello world"); !reflect.DeepEqual(got, want[1:]) {
+		t.Fatalf("Arguments() = %v, want %v", got, want[1:])
 	}
 }
 

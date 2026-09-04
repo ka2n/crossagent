@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/ka2n/crossagent"
+	"github.com/ka2n/crossagent/paths"
 )
 
 func main() {
@@ -13,7 +14,28 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Detect warning: %v\n", err)
 	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Getwd warning: %v\n", err)
+		cwd = ""
+	}
+	resolver := paths.DefaultResolver()
 	for _, agent := range agents {
-		fmt.Printf("agent=%s found=%t version=%s capabilities=%s path=%s\n", agent.Name, agent.Found, agent.Version, agent.Capabilities, agent.Path)
+		configPath, sessionDir := agentPaths(resolver, agent.Name, cwd)
+		fmt.Printf("agent=%s found=%t version=%s capabilities=%s path=%s config=%s session_dir=%s\n",
+			agent.Name, agent.Found, agent.Version, agent.Capabilities, agent.Path, configPath, sessionDir)
+	}
+}
+
+func agentPaths(resolver paths.Resolver, agent, cwd string) (configPath, sessionDir string) {
+	switch agent {
+	case "claude":
+		return resolver.ClaudeConfigPath(paths.User, cwd), resolver.ClaudeSessionDir(cwd)
+	case "codex":
+		return resolver.CodexConfigPath(paths.User, cwd), resolver.CodexSessionRoot()
+	case "pi":
+		return resolver.PiConfigPath(paths.User, cwd), resolver.PiSessionDir(cwd)
+	default:
+		return "", ""
 	}
 }
