@@ -26,8 +26,12 @@ Message delivery is also not an operation in this library. Claude's socket,
 Codex's queue command, and pi's in-process extensions have different
 authentication, lifecycle, and safety requirements; shelling out or mutating a
 live session would make this facts library responsible for side effects it
-cannot safely coordinate. Codex's documented command is retained as exported
-capability data only: the library never executes it.
+cannot safely coordinate. There is no delivery API here because only Codex
+accepts an external message from an arbitrary process: Claude Code's session
+inbox socket accepts a raw write but never delivers it, since a delivered peer
+message carries the sender's own socket as identity, and pi offers only
+in-process injection from a JS extension. Delivery therefore belongs to the
+tool that owns the message store.
 
 The encoded facts are based on `ka2n/agents-runtime-notes`, with comments and
 API metadata distinguishing documented, OSS-confirmed, and locally observed
@@ -41,15 +45,11 @@ executables are reported as `Found: false` rather than returned as errors. The
 detector is injectable, so tests and embedding applications can provide their
 own PATH lookup and command runner.
 
-| Agent | Hooks | External command data | JS extensions | RPC mode |
-| --- | ---: | ---: | ---: | ---: |
-| Claude Code | yes | no | no | no |
-| Codex | yes | `codex queue --thread {thread_id} --message {message}` | no | no |
-| pi | no | no | yes | yes |
-
-The `ExternalMessageCommand` on the Codex `Agent` only describes an argv
-template. Its `Command` and `Arguments` methods build slices and do not start a
-process.
+| Agent | Hooks | JS extensions | RPC mode |
+| --- | ---: | ---: | ---: |
+| Claude Code | yes | no | no |
+| Codex | yes | no | no |
+| pi | no | yes | yes |
 
 ```go
 package main

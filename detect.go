@@ -24,10 +24,10 @@ const (
 	// external commands for agent events; pi does not expose such hooks.
 	CapabilityHooks Capabilities = 1 << iota
 
-	// CapabilityExternalMessageQueue means that the CLI documents an external
-	// message command. Codex documents `codex queue --thread <id> --message
-	// <text>`; the other two CLIs do not expose an equivalent command. This
-	// bit describes command data only; crossagent does not execute it.
+	// CapabilityExternalMessageQueue means that the CLI documents a command an
+	// external process can use to message a running session. Codex documents
+	// such a command; the other two CLIs do not. See the agent's own
+	// documentation for the exact syntax, which this library does not encode.
 	CapabilityExternalMessageQueue
 
 	// CapabilityExtensions means that the CLI can load JavaScript extensions.
@@ -68,55 +68,6 @@ func (c Capabilities) String() string {
 	return strings.Join(names, ",")
 }
 
-// ExternalMessageCommand describes a supported CLI command shape without
-// executing it. Args contains literal arguments and the placeholders
-// PlaceholderThreadID and PlaceholderMessage.
-//
-// This is capability data, not a delivery interface: crossagent does not
-// shell out, open a session transport, or decide when it is safe to send.
-type ExternalMessageCommand struct {
-	// Binary is the executable name, normally "codex".
-	Binary string
-	// Args is an argv template, excluding Binary.
-	Args []string
-}
-
-const (
-	// PlaceholderThreadID marks the argument position for a target session id.
-	PlaceholderThreadID = "{thread_id}"
-	// PlaceholderMessage marks the argument position for message text.
-	PlaceholderMessage = "{message}"
-)
-
-// Arguments expands c's argv template without invoking a process. It returns
-// nil when c has no command data.
-func (c ExternalMessageCommand) Arguments(threadID, message string) []string {
-	if c.Binary == "" && len(c.Args) == 0 {
-		return nil
-	}
-	args := make([]string, len(c.Args))
-	for i, arg := range c.Args {
-		switch arg {
-		case PlaceholderThreadID:
-			args[i] = threadID
-		case PlaceholderMessage:
-			args[i] = message
-		default:
-			args[i] = arg
-		}
-	}
-	return args
-}
-
-// Command returns a complete argv vector, including the executable name, and
-// never executes it.
-func (c ExternalMessageCommand) Command(threadID, message string) []string {
-	if c.Binary == "" && len(c.Args) == 0 {
-		return nil
-	}
-	return append([]string{c.Binary}, c.Arguments(threadID, message)...)
-}
-
 // Agent describes one of the coding-agent CLIs known to this package.
 type Agent struct {
 	// Name is the canonical crossagent name: claude, codex, or pi.
@@ -132,10 +83,6 @@ type Agent struct {
 	Version string
 	// Capabilities describes the known integration surfaces of the agent.
 	Capabilities Capabilities
-	// ExternalMessageCommand is exported capability data for an agent's
-	// documented external-message CLI command. It is nil when no such command
-	// is known. The library does not execute it.
-	ExternalMessageCommand *ExternalMessageCommand
 }
 
 // LookPathFunc looks up an executable. It defaults to exec.LookPath.
@@ -169,21 +116,9 @@ var DefaultDetector = NewDetector()
 var ErrUnknownAgent = errors.New("unknown agent")
 
 type agentSpec struct {
-	name                   string
-	binary                 string
-	capabilities           Capabilities
-	externalMessageCommand *ExternalMessageCommand
-}
-
-var codexExternalMessageCommand = &ExternalMessageCommand{
-	Binary: "codex",
-	Args: []string{
-		"queue",
-		"--thread",
-		PlaceholderThreadID,
-		"--message",
-		PlaceholderMessage,
-	},
+	name         string
+	binary       string
+	capabilities Capabilities
 }
 
 var agentSpecs = []agentSpec{
@@ -198,10 +133,9 @@ var agentSpecs = []agentSpec{
 	{
 		name:   "codex",
 		binary: "codex",
-		// Codex has documented hook configuration and the observable
-		// `codex queue --thread <id> --message <text>` command.
-		capabilities:           CapabilityHooks | CapabilityExternalMessageQueue,
-		externalMessageCommand: codexExternalMessageCommand,
+		// Codex has documented hook configuration and a documented command
+		// that lets an external process message a running session.
+		capabilities: CapabilityHooks | CapabilityExternalMessageQueue,
 	},
 	{
 		name:   "pi",
@@ -261,12 +195,6 @@ func (d Detector) detectOne(ctx context.Context, spec agentSpec) (Agent, error) 
 		Binary:       spec.binary,
 		Capabilities: spec.capabilities,
 	}
-	if spec.externalMessageCommand != nil {
-		command := *spec.externalMessageCommand
-		command.Args = append([]string(nil), command.Args...)
-		agent.ExternalMessageCommand = &command
-	}
-
 	lookPath := d.LookPath
 	if lookPath == nil {
 		lookPath = exec.LookPath
