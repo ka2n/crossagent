@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/ka2n/crossagent/agent"
 )
 
 // ClaudeSessionLister discovers sessions from Claude's CLI and project
@@ -251,7 +253,7 @@ func mergeClaudeCandidates(candidates []claudeCandidate) []Session {
 		if current == nil {
 			current = &mergedCandidate{
 				session: Session{
-					Agent:     "claude",
+					Agent:     agent.Claude,
 					SessionID: id,
 				},
 				sources: make(map[string]bool),

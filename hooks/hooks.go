@@ -14,16 +14,20 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/ka2n/crossagent/agent"
 )
 
-// Agent names are the canonical names used by crossagent.Detector.
+// Agent names are the canonical names used by crossagent.Detector. They alias
+// the agent package's constants, which are the single definition of the
+// vocabulary.
 const (
 	// AgentClaude is Claude Code's canonical name.
-	AgentClaude = "claude"
+	AgentClaude = agent.Claude
 	// AgentCodex is Codex's canonical name.
-	AgentCodex = "codex"
+	AgentCodex = agent.Codex
 	// AgentPi is pi's canonical name.
-	AgentPi = "pi"
+	AgentPi = agent.Pi
 )
 
 // Event is a canonical lifecycle event name. Claude Code's spelling is used
@@ -200,8 +204,8 @@ type MarkerSupport struct {
 // hooks.json deserializer appears to ignore unknown command-entry keys in the
 // inspected OSS source, but local end-to-end tolerance is unverified, so
 // Codex remains unsupported for marker-authoritative management.
-func MarkerSupportFor(agent string) MarkerSupport {
-	switch normalizeAgent(agent) {
+func MarkerSupportFor(name agent.Name) MarkerSupport {
+	switch name {
 	case AgentClaude:
 		return MarkerSupport{
 			Supported:            true,
@@ -332,8 +336,8 @@ type Surface struct {
 
 // SurfaceFor returns the hook surface for agent. An unknown agent has
 // HasHooks=false and no events.
-func SurfaceFor(agent string) Surface {
-	switch normalizeAgent(agent) {
+func SurfaceFor(name agent.Name) Surface {
+	switch name {
 	case AgentClaude:
 		return Surface{
 			HasHooks:          true,
@@ -366,16 +370,16 @@ func CanonicalEvents() []Event {
 
 // Events returns the declared hook events for agent. For pi it returns nil and
 // SurfaceFor explicitly reports HasHooks=false.
-func Events(agent string) []Event {
-	return cloneEvents(SurfaceFor(agent).Events)
+func Events(name agent.Name) []Event {
+	return cloneEvents(SurfaceFor(name).Events)
 }
 
 // SessionStartSources returns the known values of a SessionStart source field.
 // These values are event-payload vocabulary, not configuration scopes. The
 // list is based on the inspected Claude and Codex schemas and may grow with a
 // vendor release.
-func SessionStartSources(agent string) []string {
-	switch normalizeAgent(agent) {
+func SessionStartSources(name agent.Name) []string {
+	switch name {
 	case AgentClaude:
 		return []string{SourceStartup, SourceResume, SourceClear, SourceCompact, SourceFork}
 	case AgentCodex:
@@ -388,14 +392,14 @@ func SessionStartSources(agent string) []string {
 // OperationalEvents returns events dispatched by the inspected command-hook
 // implementation. It is useful when declared protocol vocabulary is wider
 // than the current executable's command runner.
-func OperationalEvents(agent string) []Event {
-	return cloneEvents(SurfaceFor(agent).OperationalEvents)
+func OperationalEvents(name agent.Name) []Event {
+	return cloneEvents(SurfaceFor(name).OperationalEvents)
 }
 
 // SupportsEvent reports whether event is in the agent's declared hook
 // vocabulary. It returns false for pi and unknown agents.
-func SupportsEvent(agent string, event Event) bool {
-	for _, candidate := range SurfaceFor(agent).Events {
+func SupportsEvent(name agent.Name, event Event) bool {
+	for _, candidate := range SurfaceFor(name).Events {
 		if candidate == event {
 			return true
 		}
@@ -406,8 +410,8 @@ func SupportsEvent(agent string, event Event) bool {
 // IsOperationalEvent reports whether event is currently dispatched by the
 // inspected command-hook engine. This does not promise that a future agent
 // release will keep the same subset.
-func IsOperationalEvent(agent string, event Event) bool {
-	for _, candidate := range SurfaceFor(agent).OperationalEvents {
+func IsOperationalEvent(name agent.Name, event Event) bool {
+	for _, candidate := range SurfaceFor(name).OperationalEvents {
 		if candidate == event {
 			return true
 		}
@@ -426,8 +430,8 @@ type Mapping struct {
 // Mappings returns all mappings for agent. Claude and Codex currently use the
 // same spelling as the canonical event; keeping the mapping explicit allows
 // future agent-specific spellings without changing downstream tables.
-func Mappings(agent string) []Mapping {
-	events := Events(agent)
+func Mappings(name agent.Name) []Mapping {
+	events := Events(name)
 	if len(events) == 0 {
 		return nil
 	}
@@ -441,9 +445,9 @@ func Mappings(agent string) []Mapping {
 // ToCanonical converts an agent event name to the shared vocabulary. Unknown
 // or unsupported names return UnknownEvent and false; the original name is
 // not discarded by ParsePayload, which stores it in RawEventName.
-func ToCanonical(agent, eventName string) (Event, bool) {
+func ToCanonical(name agent.Name, eventName string) (Event, bool) {
 	event := Event(eventName)
-	if !SupportsEvent(agent, event) {
+	if !SupportsEvent(name, event) {
 		return UnknownEvent, false
 	}
 	return event, true
@@ -452,8 +456,8 @@ func ToCanonical(agent, eventName string) (Event, bool) {
 // FromCanonical converts a canonical event to the exact agent spelling.
 // Claude and Codex are identity mappings; pi and unknown agents have no
 // mapping.
-func FromCanonical(agent string, event Event) (string, bool) {
-	if !SupportsEvent(agent, event) {
+func FromCanonical(name agent.Name, event Event) (string, bool) {
+	if !SupportsEvent(name, event) {
 		return "", false
 	}
 	return string(event), true
@@ -494,8 +498,8 @@ const (
 // The table describes synchronous command output. AsyncSemanticsFor explains
 // why an async handler must not be used when delivery at the event boundary is
 // required.
-func TextReturnFor(agent string, event Event) TextReturn {
-	switch normalizeAgent(agent) {
+func TextReturnFor(name agent.Name, event Event) TextReturn {
+	switch name {
 	case AgentClaude:
 		return claudeTextReturn(event)
 	case AgentCodex:
@@ -599,17 +603,16 @@ type OutputContract struct {
 }
 
 // OutputFor returns output placement facts for agent/event.
-func OutputFor(agent string, event Event) OutputContract {
-	normalizedAgent := normalizeAgent(agent)
-	text := TextReturnFor(normalizedAgent, event)
+func OutputFor(name agent.Name, event Event) OutputContract {
+	text := TextReturnFor(name, event)
 	contract := OutputContract{Text: text, Evidence: text.Evidence}
-	switch normalizedAgent {
+	switch name {
 	case AgentClaude, AgentCodex:
 		switch event {
 		case EventStop, EventSubagentStop:
 			contract.DecisionField = FieldDecision
 			contract.ReasonField = FieldReason
-			if normalizedAgent == AgentClaude {
+			if name == AgentClaude {
 				contract.Evidence = EvidenceDocumented
 			} else {
 				contract.Evidence = EvidenceConfirmedOSS
@@ -642,10 +645,10 @@ type AsyncSemantics struct {
 
 // AsyncSemanticsFor returns async-handler semantics for agent/event. Claude
 // and Codex values describe command handlers; pi has no hook handler setting.
-func AsyncSemanticsFor(agent string, event Event) AsyncSemantics {
-	switch normalizeAgent(agent) {
+func AsyncSemanticsFor(name agent.Name, event Event) AsyncSemantics {
+	switch name {
 	case AgentClaude:
-		text := TextReturnFor(agent, event)
+		text := TextReturnFor(name, event)
 		return AsyncSemantics{
 			Supported:                  true,
 			FireAndForget:              true,
@@ -710,8 +713,8 @@ type PayloadFields struct {
 // PayloadFieldsFor returns per-agent field names. Claude and Codex payloads
 // are sparse and event-dependent; callers should not assume every non-empty
 // field is present on every invocation.
-func PayloadFieldsFor(agent string, event Event) PayloadFields {
-	switch normalizeAgent(agent) {
+func PayloadFieldsFor(name agent.Name, event Event) PayloadFields {
+	switch name {
 	case AgentClaude:
 		fields := PayloadFields{
 			SessionID:      "session_id",
@@ -863,8 +866,8 @@ var piEnvironmentVariables = []string{
 // hook command runner inherits its environment but does not explicitly export
 // a Codex hook variable. CODEX_THREAD_ID is a shell/exec-child fact, not a
 // verified hook contract.
-func EnvironmentFor(agent string) Environment {
-	switch normalizeAgent(agent) {
+func EnvironmentFor(name agent.Name) Environment {
+	switch name {
 	case AgentClaude:
 		return Environment{
 			HookSupported: true,
@@ -893,8 +896,8 @@ func EnvironmentFor(agent string) Environment {
 // EnvironmentVariables returns a copy of the known variable names for agent.
 // For Codex this is empty because no hook-specific export was verified; use
 // EnvironmentFor for the evidence note and HookSupported flag.
-func EnvironmentVariables(agent string) []string {
-	return cloneStrings(EnvironmentFor(agent).Variables)
+func EnvironmentVariables(name agent.Name) []string {
+	return cloneStrings(EnvironmentFor(name).Variables)
 }
 
 // Payload is a sparse, normalized view of a command-hook JSON object.
@@ -904,8 +907,8 @@ func EnvironmentVariables(agent string) []string {
 // as an instruction to overwrite an existing value. Unknown JSON fields and
 // unknown event names are tolerated and RawEventName preserves the latter.
 type Payload struct {
-	// Agent is the normalized agent name supplied to ParsePayload.
-	Agent string
+	// Agent is the agent name supplied to ParsePayload.
+	Agent agent.Name
 	// Event is the canonical event, or UnknownEvent for an unknown or
 	// unsupported event name.
 	Event Event
@@ -960,8 +963,7 @@ var ErrPayloadNotObject = errors.New("hook payload is not a JSON object")
 // The payload is intentionally sparse: callers merging it into a session
 // record must update only fields that are known to be present, rather than
 // replacing a whole record with zero values.
-func ParsePayload(agent string, raw []byte) (Payload, error) {
-	normalizedAgent := normalizeAgent(agent)
+func ParsePayload(name agent.Name, raw []byte) (Payload, error) {
 	var object map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &object); err != nil {
 		return Payload{}, fmt.Errorf("parse hook payload: %w", err)
@@ -970,7 +972,7 @@ func ParsePayload(agent string, raw []byte) (Payload, error) {
 		return Payload{}, ErrPayloadNotObject
 	}
 
-	payload := Payload{Agent: normalizedAgent}
+	payload := Payload{Agent: name}
 	payload.SessionID = rawString(object, "session_id")
 	payload.CWD = rawString(object, "cwd")
 	payload.TranscriptPath = rawString(object, "transcript_path")
@@ -999,33 +1001,20 @@ func ParsePayload(agent string, raw []byte) (Payload, error) {
 		payload.RawEventName = rawString(object, "event")
 	}
 	if payload.RawEventName != "" {
-		payload.Event, _ = ToCanonical(normalizedAgent, payload.RawEventName)
+		payload.Event, _ = ToCanonical(name, payload.RawEventName)
 	}
 	return payload, nil
 }
 
 // Parse is a short alias for ParsePayload.
-func Parse(agent string, raw []byte) (Payload, error) {
-	return ParsePayload(agent, raw)
+func Parse(name agent.Name, raw []byte) (Payload, error) {
+	return ParsePayload(name, raw)
 }
 
 // ParsePayloadFor is the same parser with raw first, which reads naturally at
 // call sites that receive stdin bytes before selecting an agent.
-func ParsePayloadFor(raw []byte, agent string) (Payload, error) {
-	return ParsePayload(agent, raw)
-}
-
-func normalizeAgent(agent string) string {
-	switch strings.ToLower(strings.TrimSpace(agent)) {
-	case AgentClaude, "claude-code":
-		return AgentClaude
-	case AgentCodex, "codex-cli":
-		return AgentCodex
-	case AgentPi, "pi-coding-agent":
-		return AgentPi
-	default:
-		return strings.ToLower(strings.TrimSpace(agent))
-	}
+func ParsePayloadFor(raw []byte, name agent.Name) (Payload, error) {
+	return ParsePayload(name, raw)
 }
 
 func cloneEvents(events []Event) []Event {

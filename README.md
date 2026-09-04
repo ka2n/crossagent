@@ -37,6 +37,27 @@ The encoded facts are based on `ka2n/agents-runtime-notes`, with comments and
 API metadata distinguishing documented, OSS-confirmed, and locally observed
 behavior.
 
+## Agent names
+
+`crossagent/agent` is a leaf package holding the name vocabulary as a typed
+`agent.Name`, so no other package accepts a bare string for an agent:
+
+```go
+import "github.com/ka2n/crossagent/agent"
+
+agent.Claude          // "claude"
+agent.Names()         // every canonical name, in a stable order
+agent.Parse("Codex")  // agent.Codex, nil
+agent.Parse("gemini") // "", wraps agent.ErrUnknown
+```
+
+`Parse` is the boundary for external input such as a CLI flag: it trims
+surrounding whitespace, folds ASCII case, and accepts one long-form alias per
+agent (`claude-code`, `codex-cli`, `pi-coding-agent`). Everything downstream
+takes an already-parsed `agent.Name` and does no normalization of its own. The
+root package re-exports the type and the three constants, so
+`crossagent.Codex` works without a second import.
+
 ## Detection
 
 `crossagent.Detect` checks PATH for Claude Code, Codex, and pi, runs each found
@@ -112,7 +133,7 @@ facts, and async behavior. pi is explicitly represented as having no
 declarative hook system; its supported integration surface is JavaScript
 extensions.
 
-`hooks.ParsePayload` accepts sparse JSON objects and an agent name. Unknown
+`hooks.ParsePayload` accepts sparse JSON objects and an `agent.Name`. Unknown
 fields and event names are preserved/tolerated, while malformed JSON and
 non-object JSON are errors. Missing fields remain zero values; callers merging
 a payload into state should update fields individually rather than replacing a

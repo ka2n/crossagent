@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ka2n/crossagent/agent"
 	"github.com/ka2n/crossagent/paths"
 )
 
@@ -117,8 +118,8 @@ type ConfigManager struct {
 	// Resolver supplies home and environment lookup behavior for scope paths.
 	Resolver paths.Resolver
 	// Agent is the canonical agent name. Configuration mutation currently
-	// accepts "claude"; Codex remains gated by marker-support evidence.
-	Agent string
+	// accepts AgentClaude; Codex remains gated by marker-support evidence.
+	Agent agent.Name
 	// Scope selects the user, project, or local configuration path. Empty
 	// means paths.ScopeUser.
 	Scope paths.Scope
@@ -149,7 +150,7 @@ type ConfigManager struct {
 
 type managerConfig struct {
 	manager       ConfigManager
-	agent         string
+	agent         agent.Name
 	scope         paths.Scope
 	toolName      string
 	invocation    string
@@ -178,16 +179,16 @@ const (
 )
 
 func (m ConfigManager) config() (managerConfig, error) {
-	agent := normalizeAgent(m.Agent)
-	if agent != AgentClaude && agent != AgentCodex {
-		if agent == AgentPi {
+	name := m.Agent
+	if name != AgentClaude && name != AgentCodex {
+		if name == AgentPi {
 			return managerConfig{}, errors.New("pi has no declarative hook configuration; load a JavaScript extension instead")
 		}
 		return managerConfig{}, fmt.Errorf("unsupported hook configuration agent %q", m.Agent)
 	}
-	markerSupport := MarkerSupportFor(agent)
+	markerSupport := MarkerSupportFor(name)
 	if !markerSupport.Supported {
-		return managerConfig{}, fmt.Errorf("hook configuration for %s is unsupported until ownership-marker tolerance is established: %s", agent, markerSupport.Note)
+		return managerConfig{}, fmt.Errorf("hook configuration for %s is unsupported until ownership-marker tolerance is established: %s", name, markerSupport.Note)
 	}
 	toolName := strings.TrimSpace(m.ToolName)
 	if toolName == "" {
@@ -214,7 +215,7 @@ func (m ConfigManager) config() (managerConfig, error) {
 	}
 	return managerConfig{
 		manager:       m,
-		agent:         agent,
+		agent:         name,
 		scope:         scope,
 		toolName:      toolName,
 		invocation:    invocation,

@@ -3,19 +3,21 @@ package hooks
 import (
 	"reflect"
 	"testing"
+
+	"github.com/ka2n/crossagent/agent"
 )
 
 func TestEventMappingsRoundTrip(t *testing.T) {
-	for _, agent := range []string{AgentClaude, AgentCodex} {
-		t.Run(agent, func(t *testing.T) {
-			for _, event := range Events(agent) {
-				name, ok := FromCanonical(agent, event)
+	for _, name := range []agent.Name{AgentClaude, AgentCodex} {
+		t.Run(name.String(), func(t *testing.T) {
+			for _, event := range Events(name) {
+				spelling, ok := FromCanonical(name, event)
 				if !ok {
-					t.Fatalf("FromCanonical(%q, %q) failed", agent, event)
+					t.Fatalf("FromCanonical(%q, %q) failed", name, event)
 				}
-				got, ok := ToCanonical(agent, name)
+				got, ok := ToCanonical(name, spelling)
 				if !ok || got != event {
-					t.Fatalf("round trip %q -> %q -> %q (ok=%v)", event, name, got, ok)
+					t.Fatalf("round trip %q -> %q -> %q (ok=%v)", event, spelling, got, ok)
 				}
 			}
 		})
@@ -161,7 +163,7 @@ func TestAsyncSemantics(t *testing.T) {
 func TestParsePayloads(t *testing.T) {
 	tests := []struct {
 		name  string
-		agent string
+		agent agent.Name
 		raw   string
 		check func(t *testing.T, payload Payload)
 	}{

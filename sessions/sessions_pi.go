@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/ka2n/crossagent/agent"
 )
 
 // PiSessionLister enumerates pi's JSONL session files under its configured
@@ -70,7 +72,7 @@ func (l *PiSessionLister) List(ctx context.Context) ([]Session, error) {
 			lastActivity = parseTextTime(header.Timestamp)
 		}
 		sessions = append(sessions, Session{
-			Agent:        "pi",
+			Agent:        agent.Pi,
 			SessionID:    id,
 			Cwd:          header.Cwd,
 			Label:        filepath.Base(filepath.Clean(header.Cwd)),

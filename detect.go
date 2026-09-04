@@ -7,7 +7,31 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+
+	"github.com/ka2n/crossagent/agent"
 )
+
+// Name is the canonical name of a coding-agent CLI. It is an alias for
+// agent.Name so that a caller naming one agent does not need a second import;
+// the agent package remains the place where the vocabulary is defined.
+type Name = agent.Name
+
+// The canonical agent names, aliased from the agent package.
+const (
+	// Claude is Claude Code's canonical name.
+	Claude = agent.Claude
+	// Codex is Codex's canonical name.
+	Codex = agent.Codex
+	// Pi is pi's canonical name.
+	Pi = agent.Pi
+)
+
+// Names returns every canonical agent name in a stable order.
+func Names() []Name { return agent.Names() }
+
+// ParseName converts external input, such as a CLI flag, into a Name. See
+// agent.Parse for the accepted spellings and aliases.
+func ParseName(s string) (Name, error) { return agent.Parse(s) }
 
 // Capabilities is a bitset of capabilities exposed by a coding-agent CLI.
 // A bit describes an observable integration surface, not an estimate of what
@@ -70,8 +94,8 @@ func (c Capabilities) String() string {
 
 // Agent describes one of the coding-agent CLIs known to this package.
 type Agent struct {
-	// Name is the canonical crossagent name: claude, codex, or pi.
-	Name string
+	// Name is the canonical crossagent name.
+	Name Name
 	// Binary is the executable name looked up on PATH.
 	Binary string
 	// Path is the resolved executable path. It is empty when Found is false.
@@ -113,17 +137,19 @@ func NewDetector() Detector {
 var DefaultDetector = NewDetector()
 
 // ErrUnknownAgent reports a name that is not part of the first-pass agent set.
-var ErrUnknownAgent = errors.New("unknown agent")
+// It is agent.ErrUnknown, so a name rejected by ParseName and one rejected by
+// DetectOne match the same errors.Is check.
+var ErrUnknownAgent = agent.ErrUnknown
 
 type agentSpec struct {
-	name         string
+	name         Name
 	binary       string
 	capabilities Capabilities
 }
 
 var agentSpecs = []agentSpec{
 	{
-		name:   "claude",
+		name:   Claude,
 		binary: "claude",
 		// Claude's hook support is documented by its settings/hook events.
 		// Its CLI help has no external queue command, so no queue bit is set
@@ -131,14 +157,14 @@ var agentSpecs = []agentSpec{
 		capabilities: CapabilityHooks,
 	},
 	{
-		name:   "codex",
+		name:   Codex,
 		binary: "codex",
 		// Codex has documented hook configuration and a documented command
 		// that lets an external process message a running session.
 		capabilities: CapabilityHooks | CapabilityExternalMessageQueue,
 	},
 	{
-		name:   "pi",
+		name:   Pi,
 		binary: "pi",
 		// pi's --extension/-e and --mode rpc flags establish these two
 		// surfaces. It has neither hooks nor an external queue CLI.
@@ -167,7 +193,7 @@ func (d Detector) Detect(ctx context.Context) ([]Agent, error) {
 }
 
 // DetectOne reports one known agent. Missing executables are not errors.
-func (d Detector) DetectOne(ctx context.Context, name string) (Agent, error) {
+func (d Detector) DetectOne(ctx context.Context, name Name) (Agent, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -185,7 +211,7 @@ func Detect(ctx context.Context) ([]Agent, error) {
 }
 
 // DetectOne reports one known agent using DefaultDetector.
-func DetectOne(ctx context.Context, name string) (Agent, error) {
+func DetectOne(ctx context.Context, name Name) (Agent, error) {
 	return DefaultDetector.DetectOne(ctx, name)
 }
 
@@ -221,8 +247,7 @@ func (d Detector) detectOne(ctx context.Context, spec agentSpec) (Agent, error) 
 	return agent, nil
 }
 
-func specForName(name string) (agentSpec, bool) {
-	name = strings.ToLower(strings.TrimSpace(name))
+func specForName(name Name) (agentSpec, bool) {
 	for _, spec := range agentSpecs {
 		if spec.name == name {
 			return spec, true

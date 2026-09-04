@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ka2n/crossagent/agent"
 )
 
 func noEnvironment(string) (string, bool) { return "", false }
@@ -191,5 +193,74 @@ func TestTildeEnvironmentOverrideUsesInjectedHome(t *testing.T) {
 	}
 	if got, want := r.PiAgentDir(), filepath.Join("/injected/home", "custom/pi"); got != want {
 		t.Errorf("PiAgentDir() = %q, want %q", got, want)
+	}
+}
+
+func TestAgentDispatchersFollowTheTypedName(t *testing.T) {
+	r := Resolver{HomeDir: "/home/tester", LookupEnv: noEnvironment}
+	const cwd = "/work/project"
+	for _, tc := range []struct {
+		name        agent.Name
+		sessionRoot string
+		configPath  string
+		sessionDir  string
+		sessionPath string
+	}{
+		{
+			name:        agent.Claude,
+			sessionRoot: "/home/tester/.claude/projects",
+			configPath:  "/home/tester/.claude/settings.json",
+			sessionDir:  "/home/tester/.claude/projects/-work-project",
+			sessionPath: "/home/tester/.claude/projects/-work-project/session-1.jsonl",
+		},
+		{
+			name:        agent.Codex,
+			sessionRoot: "/home/tester/.codex/sessions",
+			configPath:  "/home/tester/.codex/config.toml",
+			sessionDir:  "/home/tester/.codex/sessions",
+			sessionPath: "/home/tester/.codex/sessions/*/*/*/rollout-*-session-1.jsonl",
+		},
+		{
+			name:        agent.Pi,
+			sessionRoot: "/home/tester/.pi/agent/sessions",
+			configPath:  "/home/tester/.pi/agent/settings.json",
+			sessionDir:  "/home/tester/.pi/agent/sessions/--work-project--",
+			sessionPath: "/home/tester/.pi/agent/sessions/--work-project--/*_session-1.jsonl",
+		},
+	} {
+		t.Run(tc.name.String(), func(t *testing.T) {
+			if got := r.SessionRoot(tc.name); got != tc.sessionRoot {
+				t.Errorf("SessionRoot() = %q, want %q", got, tc.sessionRoot)
+			}
+			if got := r.ConfigPath(tc.name, ScopeUser, cwd); got != tc.configPath {
+				t.Errorf("ConfigPath() = %q, want %q", got, tc.configPath)
+			}
+			if got := r.SessionDir(tc.name, cwd); got != tc.sessionDir {
+				t.Errorf("SessionDir() = %q, want %q", got, tc.sessionDir)
+			}
+			if got := r.SessionPath(tc.name, cwd, "session-1"); got != tc.sessionPath {
+				t.Errorf("SessionPath() = %q, want %q", got, tc.sessionPath)
+			}
+		})
+	}
+}
+
+func TestAgentDispatchersRejectInvalidNames(t *testing.T) {
+	r := Resolver{HomeDir: "/home/tester", LookupEnv: noEnvironment}
+	// Alias spellings are agent.Parse's job, so the dispatchers see only
+	// canonical names and treat anything else as unknown.
+	for _, name := range []agent.Name{"", "gemini", "claude-code", "Claude"} {
+		if got := r.SessionRoot(name); got != "" {
+			t.Errorf("SessionRoot(%q) = %q, want empty", name, got)
+		}
+		if got := r.ConfigPath(name, ScopeUser, "/work/project"); got != "" {
+			t.Errorf("ConfigPath(%q) = %q, want empty", name, got)
+		}
+		if got := r.SessionDir(name, "/work/project"); got != "" {
+			t.Errorf("SessionDir(%q) = %q, want empty", name, got)
+		}
+		if got := r.SessionPath(name, "/work/project", "session-1"); got != "" {
+			t.Errorf("SessionPath(%q) = %q, want empty", name, got)
+		}
 	}
 }

@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ka2n/crossagent/agent"
 	"github.com/ka2n/crossagent/paths"
 )
 
@@ -23,13 +24,13 @@ import (
 // record that produced the row. State is copied opaquely from a vendor source
 // when one reports it; storage-derived rows leave it empty.
 type Session struct {
-	Agent        string    `json:"agent"`
-	SessionID    string    `json:"session_id"`
-	Cwd          string    `json:"cwd"`
-	Label        string    `json:"label,omitempty"`
-	LastActivity time.Time `json:"last_activity"`
-	Source       string    `json:"source"`
-	State        string    `json:"state"`
+	Agent        agent.Name `json:"agent"`
+	SessionID    string     `json:"session_id"`
+	Cwd          string     `json:"cwd"`
+	Label        string     `json:"label,omitempty"`
+	LastActivity time.Time  `json:"last_activity"`
+	Source       string     `json:"source"`
+	State        string     `json:"state"`
 }
 
 // CommandRunner runs an agent CLI. It is injectable so callers and tests can
@@ -74,11 +75,11 @@ type SessionLister interface {
 // NewSessionListers returns the built-in listers keyed by their canonical
 // agent name. Each lister is independent, so adding an agent does not change
 // the storage logic of the others.
-func NewSessionListers(opts SessionListerOptions) map[string]SessionLister {
-	return map[string]SessionLister{
-		"claude": NewClaudeSessionLister(opts),
-		"codex":  NewCodexSessionLister(opts),
-		"pi":     NewPiSessionLister(opts),
+func NewSessionListers(opts SessionListerOptions) map[agent.Name]SessionLister {
+	return map[agent.Name]SessionLister{
+		agent.Claude: NewClaudeSessionLister(opts),
+		agent.Codex:  NewCodexSessionLister(opts),
+		agent.Pi:     NewPiSessionLister(opts),
 	}
 }
 
@@ -92,9 +93,8 @@ func List(ctx context.Context, opts SessionListerOptions) ([]Session, error) {
 	perLister := opts
 	perLister.Limit = 0
 	listers := NewSessionListers(perLister)
-	names := []string{"claude", "codex", "pi"}
 	all := make([]Session, 0)
-	for _, name := range names {
+	for _, name := range agent.Names() {
 		found, err := listers[name].List(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("list %s sessions: %w", name, err)
@@ -179,10 +179,9 @@ func (o SessionListerOptions) now() time.Time {
 func finishResult(opts SessionListerOptions, sessions []Session) []Session {
 	seen := make(map[string]Session, len(sessions))
 	for _, session := range sessions {
-		if strings.TrimSpace(session.Agent) == "" || strings.TrimSpace(session.SessionID) == "" || strings.TrimSpace(session.Cwd) == "" {
+		if session.Agent == "" || strings.TrimSpace(session.SessionID) == "" || strings.TrimSpace(session.Cwd) == "" {
 			continue
 		}
-		session.Agent = strings.TrimSpace(session.Agent)
 		session.SessionID = strings.TrimSpace(session.SessionID)
 		session.Cwd = filepath.Clean(strings.TrimSpace(session.Cwd))
 		if session.Source == "" {
@@ -191,7 +190,7 @@ func finishResult(opts SessionListerOptions, sessions []Session) []Session {
 		if session.Label == "" {
 			session.Label = filepath.Base(session.Cwd)
 		}
-		key := session.Agent + "\x00" + session.SessionID
+		key := session.Agent.String() + "\x00" + session.SessionID
 		if previous, ok := seen[key]; !ok || session.LastActivity.After(previous.LastActivity) {
 			seen[key] = session
 		}

@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/ka2n/crossagent/agent"
 )
 
 // CodexSessionLister enumerates rollout transcripts. The filesystem scan is
@@ -90,7 +92,7 @@ func (l *CodexSessionLister) List(ctx context.Context) ([]Session, error) {
 			label = filepath.Base(filepath.Clean(meta.Payload.Cwd))
 		}
 		sessions = append(sessions, Session{
-			Agent:        "codex",
+			Agent:        agent.Codex,
 			SessionID:    id,
 			Cwd:          meta.Payload.Cwd,
 			Label:        label,

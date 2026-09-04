@@ -27,13 +27,13 @@ func main() {
 	}
 }
 
-func agentPaths(resolver paths.Resolver, agent, cwd string) (configPath, sessionDir string) {
-	switch agent {
-	case "claude":
+func agentPaths(resolver paths.Resolver, name crossagent.Name, cwd string) (configPath, sessionDir string) {
+	switch name {
+	case crossagent.Claude:
 		return resolver.ClaudeConfigPath(paths.User, cwd), resolver.ClaudeSessionDir(cwd)
-	case "codex":
+	case crossagent.Codex:
 		return resolver.CodexConfigPath(paths.User, cwd), resolver.CodexSessionRoot()
-	case "pi":
+	case crossagent.Pi:
 		return resolver.PiConfigPath(paths.User, cwd), resolver.PiSessionDir(cwd)
 	default:
 		return "", ""

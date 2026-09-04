@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"sort"
+
+	"github.com/ka2n/crossagent/agent"
 )
 
 // DiffKeyOrderNote explains the representation detail behind settings diffs.
@@ -52,7 +54,7 @@ type ChangeSummary struct {
 // configuration change. The manager does not print or prompt.
 type ChangePlan struct {
 	Path       string
-	Agent      string
+	Agent      agent.Name
 	Operation  ChangeOperation
 	FileExists bool
 	FileSize   int64
@@ -68,7 +70,7 @@ type ChangePlan struct {
 
 	path        string
 	operation   ChangeOperation
-	agent       string
+	agent       agent.Name
 	toolName    string
 	invocation  string
 	before      map[string]any

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ka2n/crossagent/agent"
 	"github.com/ka2n/crossagent/paths"
 )
 
@@ -282,15 +283,15 @@ func TestPiSessionListerScansEncodedSessionDirectories(t *testing.T) {
 
 func TestSortSessionsNewestFirst(t *testing.T) {
 	sessions := []Session{
-		{Agent: "pi", SessionID: "old", LastActivity: time.Unix(1, 0)},
-		{Agent: "claude", SessionID: "new", LastActivity: time.Unix(2, 0)},
-		{Agent: "codex", SessionID: "tie", LastActivity: time.Unix(2, 0)},
+		{Agent: agent.Pi, SessionID: "old", LastActivity: time.Unix(1, 0)},
+		{Agent: agent.Claude, SessionID: "new", LastActivity: time.Unix(2, 0)},
+		{Agent: agent.Codex, SessionID: "tie", LastActivity: time.Unix(2, 0)},
 	}
 	SortSessions(sessions)
 	want := []string{"claude:new", "codex:tie", "pi:old"}
 	got := make([]string, len(sessions))
 	for i, session := range sessions {
-		got[i] = session.Agent + ":" + session.SessionID
+		got[i] = session.Agent.String() + ":" + session.SessionID
 	}
 	if !reflect.DeepEqual(want, got) {
 		t.Fatalf("sort mismatch: got %v, want %v", got, want)
@@ -305,7 +306,7 @@ func TestSessionListerHandlesMissingStorage(t *testing.T) {
 		},
 	}
 	for name, lister := range NewSessionListers(options) {
-		t.Run(name, func(t *testing.T) {
+		t.Run(name.String(), func(t *testing.T) {
 			got, err := lister.List(context.Background())
 			if err != nil {
 				t.Fatalf("list missing %s storage: %v", name, err)
@@ -346,14 +347,14 @@ func TestSessionListerOptionsUseInjectedPathsEnvironment(t *testing.T) {
 func TestSessionResultLimitAndDeduplication(t *testing.T) {
 	now := time.Unix(100, 0)
 	got := finishResult(SessionListerOptions{Limit: 2}, []Session{
-		{Agent: "pi", SessionID: "old", Cwd: "/old", LastActivity: now.Add(-time.Hour)},
-		{Agent: "pi", SessionID: "new", Cwd: "/new", LastActivity: now},
-		{Agent: "pi", SessionID: "new", Cwd: "/new", Label: "newer", LastActivity: now.Add(time.Minute)},
-		{Agent: "claude", SessionID: "invalid", Cwd: ""},
+		{Agent: agent.Pi, SessionID: "old", Cwd: "/old", LastActivity: now.Add(-time.Hour)},
+		{Agent: agent.Pi, SessionID: "new", Cwd: "/new", LastActivity: now},
+		{Agent: agent.Pi, SessionID: "new", Cwd: "/new", Label: "newer", LastActivity: now.Add(time.Minute)},
+		{Agent: agent.Claude, SessionID: "invalid", Cwd: ""},
 	})
 	want := []Session{
-		{Agent: "pi", SessionID: "new", Cwd: "/new", Label: "newer", LastActivity: now.Add(time.Minute), Source: "unknown"},
-		{Agent: "pi", SessionID: "old", Cwd: "/old", Label: "old", LastActivity: now.Add(-time.Hour), Source: "unknown"},
+		{Agent: agent.Pi, SessionID: "new", Cwd: "/new", Label: "newer", LastActivity: now.Add(time.Minute), Source: "unknown"},
+		{Agent: agent.Pi, SessionID: "old", Cwd: "/old", Label: "old", LastActivity: now.Add(-time.Hour), Source: "unknown"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("finishResult = %#v, want %#v", got, want)

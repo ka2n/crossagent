@@ -37,12 +37,12 @@ func TestDetectorFindsVersionsAndCapabilities(t *testing.T) {
 		t.Fatalf("Detect() returned %d agents, want 3", len(agents))
 	}
 	want := []Agent{
-		{Name: "claude", Binary: "claude", Path: "/fake/bin/claude", Found: true, Version: "2.1.251", Capabilities: CapabilityHooks},
+		{Name: Claude, Binary: "claude", Path: "/fake/bin/claude", Found: true, Version: "2.1.251", Capabilities: CapabilityHooks},
 		{
-			Name: "codex", Binary: "codex", Path: "/fake/bin/codex", Found: true, Version: "0.151.0",
+			Name: Codex, Binary: "codex", Path: "/fake/bin/codex", Found: true, Version: "0.151.0",
 			Capabilities: CapabilityHooks | CapabilityExternalMessageQueue,
 		},
-		{Name: "pi", Binary: "pi", Path: "/fake/bin/pi", Found: true, Version: "0.84.4", Capabilities: CapabilityExtensions | CapabilityRPCMode},
+		{Name: Pi, Binary: "pi", Path: "/fake/bin/pi", Found: true, Version: "0.84.4", Capabilities: CapabilityExtensions | CapabilityRPCMode},
 	}
 	if !reflect.DeepEqual(agents, want) {
 		t.Fatalf("Detect() = %+v, want %+v", agents, want)
@@ -65,14 +65,14 @@ func TestDetectorReportsMissingAgentWithoutError(t *testing.T) {
 		},
 	}
 
-	agent, err := detector.DetectOne(context.Background(), "codex")
+	detected, err := detector.DetectOne(context.Background(), Codex)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if agent.Found || agent.Path != "" || agent.Version != "" {
-		t.Fatalf("missing agent = %+v", agent)
+	if detected.Found || detected.Path != "" || detected.Version != "" {
+		t.Fatalf("missing agent = %+v", detected)
 	}
-	if !agent.Capabilities.Has(CapabilityExternalMessageQueue) {
+	if !detected.Capabilities.Has(CapabilityExternalMessageQueue) {
 		t.Fatal("missing Codex result lost its static capability description")
 	}
 }
@@ -83,19 +83,35 @@ func TestDetectorVersionErrorStillReportsFoundAgent(t *testing.T) {
 		Run:      func(context.Context, string, ...string) ([]byte, error) { return nil, errors.New("failed") },
 	}
 
-	agent, err := detector.DetectOne(context.Background(), "claude")
+	detected, err := detector.DetectOne(context.Background(), Claude)
 	if err == nil {
 		t.Fatal("DetectOne() returned nil error for failed version command")
 	}
-	if !agent.Found || agent.Path != "/fake/claude" {
-		t.Fatalf("version failure result = %+v", agent)
+	if !detected.Found || detected.Path != "/fake/claude" {
+		t.Fatalf("version failure result = %+v", detected)
 	}
 }
 
 func TestDetectOneUnknownAgent(t *testing.T) {
-	_, err := (Detector{}).DetectOne(context.Background(), "gemini")
-	if !errors.Is(err, ErrUnknownAgent) {
-		t.Fatalf("DetectOne() error = %v, want ErrUnknownAgent", err)
+	// DetectOne takes a canonical Name and does not normalize: an alias
+	// spelling belongs to ParseName, which is where CLI input is converted.
+	for _, name := range []Name{"gemini", "claude-code", "", " claude "} {
+		if _, err := (Detector{}).DetectOne(context.Background(), name); !errors.Is(err, ErrUnknownAgent) {
+			t.Fatalf("DetectOne(%q) error = %v, want ErrUnknownAgent", name, err)
+		}
+	}
+}
+
+func TestNameAliasesAreReExportedFromAgentPackage(t *testing.T) {
+	if !reflect.DeepEqual(Names(), []Name{Claude, Codex, Pi}) {
+		t.Fatalf("Names() = %v", Names())
+	}
+	name, err := ParseName(" Claude-Code ")
+	if err != nil || name != Claude {
+		t.Fatalf("ParseName() = %q, %v, want %q", name, err, Claude)
+	}
+	if _, err := ParseName("gemini"); !errors.Is(err, ErrUnknownAgent) {
+		t.Fatalf("ParseName(\"gemini\") error = %v, want ErrUnknownAgent", err)
 	}
 }
 

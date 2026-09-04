@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf16"
+
+	"github.com/ka2n/crossagent/agent"
 )
 
 // Scope identifies a configuration scope shared by the agents where it
@@ -394,14 +396,15 @@ func EncodePiCWD(cwd string) string {
 }
 
 // SessionRoot returns the session root for a known agent name. It is a
-// convenience for code that dispatches on detection results.
-func (r Resolver) SessionRoot(agent string) string {
-	switch normalizeAgent(agent) {
-	case "claude":
+// convenience for code that dispatches on detection results. An invalid name
+// returns an empty string.
+func (r Resolver) SessionRoot(name agent.Name) string {
+	switch name {
+	case agent.Claude:
 		return r.ClaudeSessionRoot()
-	case "codex":
+	case agent.Codex:
 		return r.CodexSessionRoot()
-	case "pi":
+	case agent.Pi:
 		return r.PiSessionRoot()
 	default:
 		return ""
@@ -409,14 +412,14 @@ func (r Resolver) SessionRoot(agent string) string {
 }
 
 // ConfigPath returns an agent-specific user/project/local configuration path.
-// Unsupported scopes and unknown agents return an empty string.
-func (r Resolver) ConfigPath(agent string, scope Scope, cwd string) string {
-	switch normalizeAgent(agent) {
-	case "claude":
+// Unsupported scopes and invalid names return an empty string.
+func (r Resolver) ConfigPath(name agent.Name, scope Scope, cwd string) string {
+	switch name {
+	case agent.Claude:
 		return r.ClaudeConfigPath(scope, cwd)
-	case "codex":
+	case agent.Codex:
 		return r.CodexConfigPath(scope, cwd)
-	case "pi":
+	case agent.Pi:
 		return r.PiConfigPath(scope, cwd)
 	default:
 		return ""
@@ -426,13 +429,13 @@ func (r Resolver) ConfigPath(agent string, scope Scope, cwd string) string {
 // SessionDir returns an agent-specific session directory for cwd. Codex does
 // not encode cwd, so it returns its session root; an explicit pi session-dir
 // override likewise returns that complete directory.
-func (r Resolver) SessionDir(agent, cwd string) string {
-	switch normalizeAgent(agent) {
-	case "claude":
+func (r Resolver) SessionDir(name agent.Name, cwd string) string {
+	switch name {
+	case agent.Claude:
 		return r.ClaudeSessionDir(cwd)
-	case "codex":
+	case agent.Codex:
 		return r.CodexSessionRoot()
-	case "pi":
+	case agent.Pi:
 		return r.PiSessionDir(cwd)
 	default:
 		return ""
@@ -442,28 +445,15 @@ func (r Resolver) SessionDir(agent, cwd string) string {
 // SessionPath returns an agent-specific transcript path. Claude returns an
 // exact path; Codex and pi return patterns because their filenames contain
 // timestamps that are not derivable from an id and cwd alone.
-func (r Resolver) SessionPath(agent, cwd, sessionID string) string {
-	switch normalizeAgent(agent) {
-	case "claude":
+func (r Resolver) SessionPath(name agent.Name, cwd, sessionID string) string {
+	switch name {
+	case agent.Claude:
 		return r.ClaudeSessionPath(cwd, sessionID)
-	case "codex":
+	case agent.Codex:
 		return r.CodexSessionPath(cwd, sessionID)
-	case "pi":
+	case agent.Pi:
 		return r.PiSessionPath(cwd, sessionID)
 	default:
 		return ""
-	}
-}
-
-func normalizeAgent(agent string) string {
-	switch strings.ToLower(strings.TrimSpace(agent)) {
-	case "claude", "claude-code":
-		return "claude"
-	case "codex", "codex-cli":
-		return "codex"
-	case "pi", "pi-coding-agent":
-		return "pi"
-	default:
-		return strings.ToLower(strings.TrimSpace(agent))
 	}
 }
