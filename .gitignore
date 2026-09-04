@@ -1,0 +1,13 @@
+# Binaries and coverage output
+/crossagent
+/*.test
+coverage.out
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+
+# Go workspace/tooling files
+go.work
+go.work.sum
