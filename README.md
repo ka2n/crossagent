@@ -45,11 +45,15 @@ executables are reported as `Found: false` rather than returned as errors. The
 detector is injectable, so tests and embedding applications can provide their
 own PATH lookup and command runner.
 
-| Agent | Hooks | JS extensions | RPC mode |
-| --- | ---: | ---: | ---: |
-| Claude Code | yes | no | no |
-| Codex | yes | no | no |
-| pi | no | yes | yes |
+The columns below are the `Capabilities` bits, in declaration order:
+`CapabilityHooks`, `CapabilityExternalMessageQueue`, `CapabilityExtensions`,
+and `CapabilityRPCMode`.
+
+| Agent | Hooks | External message | JS extensions | RPC mode |
+| --- | ---: | ---: | ---: | ---: |
+| Claude Code | yes | no | no | no |
+| Codex | yes | yes | no | no |
+| pi | no | no | yes | yes |
 
 ```go
 package main
