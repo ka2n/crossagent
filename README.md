@@ -56,7 +56,8 @@ surrounding whitespace, folds ASCII case, and accepts one long-form alias per
 agent (`claude-code`, `codex-cli`, `pi-coding-agent`). Everything downstream
 takes an already-parsed `agent.Name` and does no normalization of its own. The
 root package re-exports the type and the three constants, so
-`crossagent.Codex` works without a second import.
+`crossagent.Codex` works without a second import; enumerating and parsing stay
+in the `agent` package, where the vocabulary lives.
 
 ## Detection
 

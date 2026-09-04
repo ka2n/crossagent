@@ -26,13 +26,6 @@ const (
 	Pi = agent.Pi
 )
 
-// Names returns every canonical agent name in a stable order.
-func Names() []Name { return agent.Names() }
-
-// ParseName converts external input, such as a CLI flag, into a Name. See
-// agent.Parse for the accepted spellings and aliases.
-func ParseName(s string) (Name, error) { return agent.Parse(s) }
-
 // Capabilities is a bitset of capabilities exposed by a coding-agent CLI.
 // A bit describes an observable integration surface, not an estimate of what
 // could be implemented by driving the agent's terminal UI.
@@ -137,8 +130,8 @@ func NewDetector() Detector {
 var DefaultDetector = NewDetector()
 
 // ErrUnknownAgent reports a name that is not part of the first-pass agent set.
-// It is agent.ErrUnknown, so a name rejected by ParseName and one rejected by
-// DetectOne match the same errors.Is check.
+// It is agent.ErrUnknown, so a name rejected by agent.Parse and one rejected
+// by DetectOne match the same errors.Is check.
 var ErrUnknownAgent = agent.ErrUnknown
 
 type agentSpec struct {

@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/ka2n/crossagent/agent"
 )
 
 func TestDetectorFindsVersionsAndCapabilities(t *testing.T) {
@@ -94,7 +96,7 @@ func TestDetectorVersionErrorStillReportsFoundAgent(t *testing.T) {
 
 func TestDetectOneUnknownAgent(t *testing.T) {
 	// DetectOne takes a canonical Name and does not normalize: an alias
-	// spelling belongs to ParseName, which is where CLI input is converted.
+	// spelling belongs to agent.Parse, which is where CLI input is converted.
 	for _, name := range []Name{"gemini", "claude-code", "", " claude "} {
 		if _, err := (Detector{}).DetectOne(context.Background(), name); !errors.Is(err, ErrUnknownAgent) {
 			t.Fatalf("DetectOne(%q) error = %v, want ErrUnknownAgent", name, err)
@@ -102,16 +104,19 @@ func TestDetectOneUnknownAgent(t *testing.T) {
 	}
 }
 
-func TestNameAliasesAreReExportedFromAgentPackage(t *testing.T) {
-	if !reflect.DeepEqual(Names(), []Name{Claude, Codex, Pi}) {
-		t.Fatalf("Names() = %v", Names())
+// TestNameConstantsAliasTheAgentPackage pins the re-export: the root's Name
+// and constants are the agent package's, so a value built with one is usable
+// with the other and ErrUnknownAgent matches a parse rejection.
+func TestNameConstantsAliasTheAgentPackage(t *testing.T) {
+	if Claude != agent.Claude || Codex != agent.Codex || Pi != agent.Pi {
+		t.Fatal("root constants are not the agent package's constants")
 	}
-	name, err := ParseName(" Claude-Code ")
-	if err != nil || name != Claude {
-		t.Fatalf("ParseName() = %q, %v, want %q", name, err, Claude)
+	var name Name = agent.Codex
+	if !name.Valid() || name.String() != "codex" {
+		t.Fatalf("Name alias lost the agent.Name methods: %q", name)
 	}
-	if _, err := ParseName("gemini"); !errors.Is(err, ErrUnknownAgent) {
-		t.Fatalf("ParseName(\"gemini\") error = %v, want ErrUnknownAgent", err)
+	if _, err := agent.Parse("gemini"); !errors.Is(err, ErrUnknownAgent) {
+		t.Fatalf("agent.Parse error = %v, want ErrUnknownAgent", err)
 	}
 }
 
