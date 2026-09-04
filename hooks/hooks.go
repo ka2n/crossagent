@@ -1,5 +1,8 @@
-// Package hooks contains the normalized lifecycle-event and command-payload
-// facts for Claude Code and Codex. It does not install, run, or write hooks.
+// Package hooks contains normalized lifecycle-event and command-payload facts
+// for Claude Code and Codex, plus an opt-in, plan-first manager for safely
+// editing declarative hook configuration. The manager never injects live
+// messages or runs a hook as part of discovery; its optional self-check is an
+// explicit caller-supplied probe.
 //
 // pi is represented explicitly as having no declarative hook system: its
 // supported integration surface is JavaScript extensions.
@@ -169,6 +172,83 @@ const (
 	// EvidenceObserved means the fact was observed in a local installation.
 	EvidenceObserved Evidence = "observed"
 )
+
+// MarkerOwnerField is the JSON key used by the configuration-management
+// layer for an owning tool name. MarkerIDField stores the stable per-entry ID.
+const MarkerOwnerField = "installedBy"
+
+// MarkerSupport describes whether an agent's configuration parser can retain
+// the explicit ownership marker used by the mutation layer. Supported refers
+// to the marker being safe to persist, not to a vendor feature or output
+// contract. OSS source that merely appears to ignore unknown keys is not
+// sufficient: support stays false until the parser behavior is established
+// for the target integration.
+type MarkerSupport struct {
+	// Supported reports whether explicit markers can be written and used.
+	Supported bool
+	// UnknownKeysTolerated reports established tolerance for the marker keys
+	// by the agent's configuration parser/runtime.
+	UnknownKeysTolerated bool
+	// Evidence identifies the source strength of the parser fact.
+	Evidence Evidence
+	// Note records version and end-to-end verification qualifications.
+	Note string
+}
+
+// MarkerSupportFor returns ownership-marker facts for agent. Claude's
+// tolerance of unknown hook-entry keys was observed locally. Codex's generic
+// hooks.json deserializer appears to ignore unknown command-entry keys in the
+// inspected OSS source, but local end-to-end tolerance is unverified, so
+// Codex remains unsupported for marker-authoritative management.
+func MarkerSupportFor(agent string) MarkerSupport {
+	switch normalizeAgent(agent) {
+	case AgentClaude:
+		return MarkerSupport{
+			Supported:            true,
+			UnknownKeysTolerated: true,
+			Evidence:             EvidenceObserved,
+			Note:                 "Claude Code 2.1.259 fired a hook entry carrying installedBy and a per-tool ID unknown key.",
+		}
+	case AgentCodex:
+		return MarkerSupport{
+			Supported:            false,
+			UnknownKeysTolerated: false,
+			Evidence:             EvidenceConfirmedOSS,
+			Note:                 "The inspected Codex hooks.json HookHandlerConfig deserializer appears to ignore unknown keys, but local end-to-end marker tolerance is unverified; marker management remains unsupported.",
+		}
+	case AgentPi:
+		return MarkerSupport{
+			Supported:            false,
+			UnknownKeysTolerated: false,
+			Evidence:             EvidenceDocumented,
+			Note:                 "pi has no declarative hook configuration in which ownership markers could be stored.",
+		}
+	default:
+		return MarkerSupport{}
+	}
+}
+
+// MarkerIDField returns the per-tool JSON key used for a stable hook-entry
+// identifier. For example, MarkerIDField("mytool") is "x-mytool-id". Tool
+// names are reduced to a safe, deterministic token.
+func MarkerIDField(toolName string) string {
+	var token strings.Builder
+	for _, r := range strings.ToLower(strings.TrimSpace(toolName)) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			token.WriteRune(r)
+		default:
+			if token.Len() == 0 || !strings.HasSuffix(token.String(), "-") {
+				token.WriteByte('-')
+			}
+		}
+	}
+	name := strings.Trim(token.String(), "-")
+	if name == "" {
+		name = "tool"
+	}
+	return "x-" + name + "-id"
+}
 
 var claudeEvents = []Event{
 	EventSessionStart,

@@ -8,12 +8,13 @@ It covers three fact-oriented capabilities:
 1. **Detect** installed agents and their versions.
 2. **Resolve** session, transcript, and configuration locations without
    filesystem discovery.
-3. **Normalize** hook events, payload fields, output channels, and async
-   semantics.
+3. **Normalize and manage** hook events, payload fields, output channels,
+   async semantics, and safe declarative configuration changes.
 
-The pure path and hook packages provide the facts needed for session-location
-discovery and hook configuration management. Writing configuration files and
-installing hooks are deliberately left to a later mutation layer.
+The path and hook packages provide the facts needed for session-location
+discovery and safe hook configuration management. Hook configuration changes
+are plan-first, marker-owned, atomic, and opt-in; live message delivery is not
+part of this library.
 
 ## Scope
 
@@ -112,6 +113,20 @@ fields and event names are preserved/tolerated, while malformed JSON and
 non-object JSON are errors. Missing fields remain zero values; callers merging
 a payload into state should update fields individually rather than replacing a
 whole record.
+
+`hooks.ConfigManager` is the mutation layer for declarative Claude settings.
+Codex's compatible JSON shape is intentionally gated until its parser's marker
+tolerance is established. Call `PlanInstall` or `PlanUninstall`, present the
+returned summary and unified diff, then call `Apply` after any caller-owned
+confirmation. New
+entries carry `installedBy` and a stable per-tool ID marker. A caller-supplied
+fallback predicate can recognize unmarked legacy entries, but matching entries
+are reported as `UnmarkedOwnershipError` and are never adopted unless
+`AdoptUnmarked` is explicitly enabled. The manager preserves unrelated keys and
+wrapper fields, verifies the prospective merge, takes a per-tool backup before
+the first write, writes atomically, and can run an injected self-check probe.
+`MarkerSupportFor` reports the evidence: Claude is locally verified; Codex
+marker tolerance remains unverified and is therefore unsupported.
 
 ## Platform and dependencies
 
