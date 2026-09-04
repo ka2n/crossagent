@@ -135,9 +135,12 @@ func (p ProcFS) PIDNamespaceInode(pid int) (uint64, error) {
 }
 
 // ReadCurrentPIDNamespaceInode returns the namespace inode visible to the
-// current process.
+// current process. It uses procfs's self entry rather than interpolating the
+// caller's numeric PID, which keeps a ProcFS rooted at a mounted host procfs
+// (for example /host/proc) internally consistent.
 func (p ProcFS) ReadCurrentPIDNamespaceInode() (uint64, error) {
-	return p.ReadPIDNamespaceInode(os.Getpid())
+	path := filepath.Join(p.root(), "self", "ns", "pid")
+	return readPIDNamespaceInode(path, os.Getpid())
 }
 
 // CurrentPIDNamespaceInode is an alias for ReadCurrentPIDNamespaceInode.

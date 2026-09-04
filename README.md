@@ -35,6 +35,63 @@ reconstructed reliably after the hook has left the namespace, which is why
 `hostpid.Collect` belongs in the hook producer and `hostpid.Resolver` belongs
 in the host observer.
 
+### Resolution direction
+
+PID namespace translation is directional:
+
+- In the **same namespace**, no translation is needed.
+- A **host consumer with an agent inside a namespace** (Docker, jai,
+  systemd-nspawn, or similar) can resolve it through `NSpid`. This is the case
+  this package exists for.
+- A **consumer inside a sandbox with an agent outside it** cannot resolve the
+  host PID: the outer process is not visible through that consumer's `/proc`.
+  This is an unsupported direction and fails closed.
+- A consumer in **container A with an agent in container B** likewise cannot
+  resolve the sibling namespace.
+
+`NSpid` is directional too: read inside a namespace it usually has only the
+local column, while an outer consumer sees the columns needed for translation.
+The field was introduced in Linux 4.1. `/proc/<pid>/status` may also be
+unreadable for another user's process, so this library reports translation as
+unavailable rather than guessing. Use `hostpid.Resolver.CanResolve` to
+separate an unsupported direction from a namespace that is visible but whose
+individual process is not found.
+
+No environment variable belonging to a particular sandbox tool is consulted;
+in particular, the library does not read `JAI_JAIL`, `/.dockerenv`,
+`/run/.containerenv`, `$container`, or cgroup paths. Those generic markers are
+not reliable: on the measured machine the marker files and variable were
+absent, while `/proc/1/cgroup` exposed the host cgroup path because the cgroup
+namespace was not unshared. The recorded namespace inode is authoritative.
+If it is unavailable, a low PID (below
+`hostpid.SuspiciousPIDThreshold`) is only a documented fallback heuristic, and
+callers can use `ProcessIdentity.AssumeNamespaced` when they genuinely know
+more.
+
+### Recovering the impossible direction
+
+`hostpid.ErrUnsupportedDirection` is the signal to try an environment-specific
+backend, not to treat the process as merely missing. The possible ways to
+restore that direction all require cooperation from outside the sandbox:
+
+- A monitoring container can mount the host procfs, conventionally at
+  `/host/proc`. `hostpid.NewResolver(procfs.New("/host/proc"))` is the whole
+  configuration-only fix; the constructor wires all five readers from that
+  `ProcFS`, while its public reader fields remain replaceable for a specialized
+  backend.
+- A Docker or podman socket can provide the host PID directly, for example
+  with `docker inspect --format '{{.State.Pid}}'`.
+- Kubernetes `hostPID: true` makes the consumer share the host PID namespace,
+  so no translation is needed.
+- A host-side helper reached over a bind-mounted socket can perform the lookup.
+  This is the architecture used by the source `way-island` project: a daemon
+  on the host and hooks inside the agent namespace.
+
+If there is no mounted host procfs, socket, host-PID sharing, or other channel
+outside the sandbox, the information simply does not exist inside it. That is
+not an implementation gap, and this library does not implement any of those
+backends in this pass.
+
 The stat parser deliberately finds the text after the **last** `)` before
 splitting fields. Linux permits spaces and parentheses in a command name, so
 splitting after the first `)` shifts `ppid` and `starttime`.

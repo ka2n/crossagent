@@ -9,6 +9,31 @@ import (
 	"testing"
 )
 
+func TestReadCurrentPIDNamespaceInodeUsesSelfEntry(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "self", "ns")
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fixture := filepath.Join(path, "pid")
+	if err := os.WriteFile(fixture, []byte("current namespace fixture"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := info.Sys().(*syscall.Stat_t).Ino
+	got, err := New(root).ReadCurrentPIDNamespaceInode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("ReadCurrentPIDNamespaceInode() = %d, want %d", got, want)
+	}
+}
+
 func TestReadPIDNamespaceInodeFromFixture(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "42", "ns")

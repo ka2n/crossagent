@@ -105,7 +105,6 @@ func TestResolverNamespacedPIDTwoCase(t *testing.T) {
 		PID:            2,
 		NamespaceInode: 4026533000,
 		StartTimeTicks: 123456,
-		InJail:         true,
 	})
 	if !ok || got != 3210 {
 		t.Fatalf("Resolve() = (%d, %t), want (3210, true)", got, ok)
@@ -183,6 +182,49 @@ func TestResolverRejectsAmbiguousCandidatesWhenReaderUnavailable(t *testing.T) {
 	}
 }
 
+func TestAssumeNamespacedForcesTranslationWithoutAnInode(t *testing.T) {
+	currentRead := false
+	r := Resolver{
+		ReadCurrentPIDNSInode: func() (uint64, error) {
+			currentRead = true
+			return 1, nil
+		},
+	}
+
+	needsTranslation, err := r.NeedsTranslation(ProcessIdentity{PID: 500, AssumeNamespaced: true})
+	if err != nil || !needsTranslation {
+		t.Fatalf("NeedsTranslation() = (%t, %v), want (true, nil)", needsTranslation, err)
+	}
+	if currentRead {
+		t.Fatal("AssumeNamespaced should not require a current inode comparison")
+	}
+}
+
+func TestResolverLowPIDFallbackWhenNamespaceInodeUnknown(t *testing.T) {
+	currentRead := false
+	r := Resolver{
+		ReadCurrentPIDNSInode: func() (uint64, error) {
+			currentRead = true
+			return 1, nil
+		},
+	}
+
+	identity := ProcessIdentity{PID: 2}
+	needsTranslation, err := r.NeedsTranslation(identity)
+	if err != nil || !needsTranslation {
+		t.Fatalf("NeedsTranslation() = (%t, %v), want (true, nil)", needsTranslation, err)
+	}
+	if currentRead {
+		t.Fatal("low-PID fallback should not inspect the current inode when the recorded inode is unknown")
+	}
+	if hostPID, ok := r.Resolve(identity); ok || hostPID != 0 {
+		t.Fatalf("Resolve() = (%d, %t), want (0, false)", hostPID, ok)
+	}
+	if _, err := r.ResolveForMonitoring(identity); !errors.Is(err, ErrHostPIDNotFound) {
+		t.Fatalf("ResolveForMonitoring() error = %v, want ErrHostPIDNotFound", err)
+	}
+}
+
 func TestResolverFailClosedForUnresolvedNamespacedIdentity(t *testing.T) {
 	rawPIDChecks := 0
 	r := Resolver{
@@ -212,8 +254,42 @@ func TestResolverFailClosedForUnresolvedNamespacedIdentity(t *testing.T) {
 	}
 }
 
+func TestCanResolveDistinguishesUnsupportedDirectionFromNotFound(t *testing.T) {
+	identity := ProcessIdentity{PID: 2, NamespaceInode: 99, StartTimeTicks: 10}
+
+	visibleNamespace := Resolver{
+		ReadCurrentPIDNSInode: func() (uint64, error) { return 1, nil },
+		ListPIDs:              func() ([]int, error) { return []int{900}, nil },
+		ReadPIDNamespaceInode: func(pid int) (uint64, error) {
+			if pid == 900 {
+				return 99, nil
+			}
+			return 0, errors.New("not found")
+		},
+		ReadNamespacedPIDs: func(int) ([]int, error) { return []int{900, 3}, nil },
+	}
+	canResolve, err := visibleNamespace.CanResolve(identity)
+	if err != nil || !canResolve {
+		t.Fatalf("CanResolve(visible namespace) = (%t, %v), want (true, nil)", canResolve, err)
+	}
+	if hostPID, ok := visibleNamespace.Resolve(identity); ok || hostPID != 0 {
+		t.Fatalf("Resolve(missing process) = (%d, %t), want (0, false)", hostPID, ok)
+	}
+
+	inaccessibleNamespace := Resolver{
+		ReadCurrentPIDNSInode: func() (uint64, error) { return 1, nil },
+		ListPIDs:              func() ([]int, error) { return []int{900}, nil },
+		ReadPIDNamespaceInode: func(int) (uint64, error) { return 1, nil },
+		ReadNamespacedPIDs:    func(int) ([]int, error) { return []int{900, 1}, nil },
+	}
+	canResolve, err = inaccessibleNamespace.CanResolve(identity)
+	if canResolve || !errors.Is(err, ErrUnsupportedDirection) {
+		t.Fatalf("CanResolve(inaccessible direction) = (%t, %v), want (false, ErrUnsupportedDirection)", canResolve, err)
+	}
+}
+
 func TestResolverDoesNotUseUnvalidatedRawPIDForNamespacedIdentity(t *testing.T) {
-	identity := ProcessIdentity{PID: 2, NamespaceInode: 99, InJail: true}
+	identity := ProcessIdentity{PID: 2, NamespaceInode: 99}
 	got, ok := (Resolver{}).Resolve(identity)
 	if ok || got != 0 {
 		t.Fatalf("Resolve() = (%d, %t), want (0, false)", got, ok)
@@ -245,6 +321,28 @@ func TestCollectFromProcFixture(t *testing.T) {
 	}
 	if identity.PID != 42 || identity.NamespaceInode == 0 || identity.StartTimeTicks != 987654 {
 		t.Fatalf("CollectFrom() = %+v, want pid 42, nonzero inode, start 987654", identity)
+	}
+}
+
+func TestNewResolverUsesConfiguredProcFS(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("PID namespace inodes are Linux-specific")
+	}
+	root := t.TempDir()
+	writeFixtureFile(t, root, "self/ns/pid", "consumer namespace")
+	writeFixtureFile(t, root, "42/ns/pid", "agent namespace")
+	writeFixtureFile(t, root, "42/status", "Name:\tagent\nNSpid:\t42\t2\n")
+	writeFixtureFile(t, root, "42/stat", "42 (agent) S 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 987654\n")
+
+	fs := procfs.New(root)
+	namespaceInode, err := fs.ReadPIDNamespaceInode(42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := NewResolver(fs)
+	got, ok := r.Resolve(ProcessIdentity{PID: 2, NamespaceInode: namespaceInode, StartTimeTicks: 987654})
+	if !ok || got != 42 {
+		t.Fatalf("configured resolver Resolve() = (%d, %t), want (42, true)", got, ok)
 	}
 }
 
