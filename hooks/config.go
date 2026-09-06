@@ -35,9 +35,11 @@ type HookEntry struct {
 	Fields  map[string]any
 }
 
-// OwnershipPredicate recognizes legacy or manually written entries that have
-// no explicit ownership marker. It is never used to override an explicit
-// marker. The default predicate is DefaultOwnershipPredicate.
+// OwnershipPredicate recognizes entries by their command and fields when
+// explicit markers are unavailable. For marker-durable agents, a predicate
+// match is an unmarked legacy entry and requires AdoptUnmarked. For agents
+// without durable markers, the predicate is the ownership authority and a
+// match is owned directly. The default predicate is DefaultOwnershipPredicate.
 type OwnershipPredicate func(HookEntry) bool
 
 // DefaultOwnershipPredicate returns the conservative legacy matcher for a
@@ -63,14 +65,15 @@ func DefaultOwnershipPredicate(toolName string) OwnershipPredicate {
 
 // UnmarkedEntry describes a command that matches the fallback ownership
 // predicate but carries no valid explicit marker. Such entries are reported
-// and never adopted silently.
+// only for agents whose markers are durable, and are never adopted silently.
 type UnmarkedEntry struct {
 	Event   string
 	Command string
 }
 
 // UnmarkedOwnershipError reports legacy-looking entries that require explicit
-// adoption before they can be removed, rewritten, or treated as installed.
+// adoption before they can be removed, rewritten, or treated as installed by
+// an agent with durable markers. Marker-less agents do not produce this error.
 type UnmarkedOwnershipError struct {
 	ToolName string
 	Entries  []UnmarkedEntry
@@ -108,8 +111,9 @@ type ApplyOptions struct {
 }
 
 // ConfigManager plans and applies changes to a JSON hook configuration file.
-// Claude's settings.json is currently supported because its marker tolerance
-// is locally verified. Codex's hooks.json shape is understood by the path and
+// Claude's settings.json is supported, but its marker keys are not durable:
+// ownership therefore uses the predicate and Claude entries are written
+// without markers. Codex's hooks.json shape is understood by the path and
 // hook-fact packages, but configuration mutation remains rejected until its
 // marker tolerance is established; pi has no declarative hook file. The
 // manager never prompts or prints. Call PlanInstall/PlanUninstall, show the
@@ -117,8 +121,9 @@ type ApplyOptions struct {
 type ConfigManager struct {
 	// Resolver supplies home and environment lookup behavior for scope paths.
 	Resolver paths.Resolver
-	// Agent is the canonical agent name. Configuration mutation currently
-	// accepts AgentClaude; Codex remains gated by marker-support evidence.
+	// Agent is the canonical agent name. Configuration mutation accepts
+	// AgentClaude; Claude uses predicate ownership because its marker fields are
+	// not durable. Codex remains gated by marker-support evidence.
 	Agent agent.Name
 	// Scope selects the user, project, or local configuration path. Empty
 	// means paths.ScopeUser.
@@ -137,11 +142,14 @@ type ConfigManager struct {
 	// Hooks declares the desired canonical events and command strings.
 	Hooks []HookSpec
 
-	// Ownership recognizes unmarked legacy entries. A nil predicate uses the
-	// default basename predicate for ToolName.
+	// Ownership recognizes entries by command when marker ownership is not
+	// available. A nil predicate uses the default basename predicate for
+	// ToolName. For marker-durable agents, matches without a marker require
+	// AdoptUnmarked; for marker-less agents, matches are owned directly.
 	Ownership OwnershipPredicate
-	// AdoptUnmarked is the explicit safety opt-in for fallback-only matches.
-	// Without it, plans return UnmarkedOwnershipError and do not change files.
+	// AdoptUnmarked is the explicit safety opt-in for fallback-only matches on
+	// marker-durable agents. It has no effect when predicate ownership is the
+	// agent's authority.
 	AdoptUnmarked bool
 	// Probe is run before a changed install plan is written. Uninstall plans
 	// do not run it.
@@ -221,7 +229,7 @@ func (m ConfigManager) config() (managerConfig, error) {
 		invocation:    invocation,
 		predicate:     predicate,
 		adoptUnmarked: m.AdoptUnmarked,
-		markerEnabled: markerSupport.Supported,
+		markerEnabled: markerSupport.Durable,
 	}, nil
 }
 
@@ -335,7 +343,8 @@ func containsString(values []string, want string) bool {
 // PlanInstall reads and validates the prospective install without writing.
 // The returned plan contains the real diff and entry summary for presentation
 // by a caller. A non-nil plan may accompany an error so an unmarked-entry
-// report can still be inspected.
+// report can still be inspected for agents whose markers are durable; agents
+// without durable markers treat predicate matches as owned directly.
 func (m ConfigManager) PlanInstall() (ChangePlan, error) {
 	return m.plan(operationInstall)
 }
@@ -728,8 +737,11 @@ func cloneHookEntry(raw map[string]any) map[string]any {
 	return out
 }
 
-func hookEntryView(event string, raw map[string]any) HookEntry {
-	return HookEntry{Event: event, Command: entryCommand(raw), Fields: cloneHookEntry(raw)}
+func predicateOwnsEntry(event string, raw map[string]any, command string, policy ownershipPolicy) bool {
+	if policy.predicate == nil {
+		return false
+	}
+	return policy.predicate(HookEntry{Event: event, Command: command, Fields: cloneHookEntry(raw)})
 }
 
 func entryCommand(entry map[string]any) string {
@@ -764,12 +776,18 @@ func looksLikeMarkerIDField(key string) bool {
 	return strings.HasPrefix(key, "x-") && strings.HasSuffix(key, "-id") && len(key) > len("x--id")
 }
 
-func classifyEntry(event string, raw map[string]any, policy ownershipPolicy) (marked, unmarked bool) {
+func classifyEntry(event string, raw map[string]any, policy ownershipPolicy) (owned, unmarked bool) {
+	if !policy.markerEnabled {
+		if predicateOwnsEntry(event, raw, entryCommand(raw), policy) {
+			return true, false
+		}
+		return false, false
+	}
 	_, marked, hasMarker := markerFor(raw, policy.toolName)
 	if hasMarker {
 		return marked, false
 	}
-	if policy.predicate != nil && policy.predicate(hookEntryView(event, raw)) {
+	if predicateOwnsEntry(event, raw, entryCommand(raw), policy) {
 		return false, true
 	}
 	return false, false
@@ -823,8 +841,8 @@ func asyncOwnedEntries(settings map[string]any, policy ownershipPolicy) []Unmark
 				if !ok {
 					continue
 				}
-				marked, unmarked := classifyEntry(event, hook, policy)
-				if (marked || unmarked) && hookBool(hook, "async") {
+				owned, unmarked := classifyEntry(event, hook, policy)
+				if (owned || unmarked) && hookBool(hook, "async") {
 					out = append(out, UnmarkedEntry{Event: event, Command: entryCommand(hook)})
 				}
 			}
@@ -845,6 +863,15 @@ func newHookEntry(entry desiredEntry, toolName string, markerEnabled bool) map[s
 		hook[MarkerIDField(toolName)] = entry.id
 	}
 	return hook
+}
+
+func stripMarkerFields(entry map[string]any) {
+	delete(entry, MarkerOwnerField)
+	for key := range entry {
+		if looksLikeMarkerIDField(key) {
+			delete(entry, key)
+		}
+	}
 }
 
 func mergeDesired(settings map[string]any, desired []desiredEntry, policy ownershipPolicy) error {
@@ -907,8 +934,8 @@ func removeOwnedEntries(settings map[string]any, policy ownershipPolicy) []Entry
 					keptInner = append(keptInner, rawHook)
 					continue
 				}
-				marked, unmarked := classifyEntry(event, hook, policy)
-				if marked || (unmarked && policy.adoptUnmarked) {
+				owned, unmarked := classifyEntry(event, hook, policy)
+				if owned || (unmarked && policy.adoptUnmarked) {
 					removedFromGroup = true
 					removed = append(removed, EntryChange{Event: event, Command: entryCommand(hook), ID: markerIDForChange(hook, policy.toolName)})
 					continue
@@ -987,18 +1014,23 @@ func convergeEntries(settings map[string]any, policy ownershipPolicy, invocation
 					keptInner = append(keptInner, rawHook)
 					continue
 				}
-				marked, unmarked := classifyEntry(event, hook, policy)
-				if !marked && !(unmarked && policy.adoptUnmarked) {
+				owned, unmarked := classifyEntry(event, hook, policy)
+				if !owned && !(unmarked && policy.adoptUnmarked) {
 					keptInner = append(keptInner, rawHook)
 					continue
 				}
 				ownedInGroup = true
 				command := entryCommand(hook)
 				old := oldEntry{event: event, command: command, action: actionKey(command), value: cloneHookEntry(hook)}
-				if id, isMarked, _ := markerFor(hook, policy.toolName); isMarked {
-					old.id = id
-					if _, exists := byID[id]; !exists {
-						byID[id] = old
+				if policy.markerEnabled {
+					if id, isMarked, _ := markerFor(hook, policy.toolName); isMarked {
+						old.id = id
+						if _, exists := byID[id]; !exists {
+							byID[id] = old
+						}
+					} else {
+						key := event + "\x00" + old.action
+						legacyByAction[key] = append(legacyByAction[key], old)
 					}
 				} else {
 					key := event + "\x00" + old.action
@@ -1059,6 +1091,8 @@ func convergeEntries(settings map[string]any, policy ownershipPolicy, invocation
 		if policy.markerEnabled {
 			hook[MarkerOwnerField] = policy.toolName
 			hook[MarkerIDField(policy.toolName)] = entry.id
+		} else {
+			stripMarkerFields(hook)
 		}
 		if anchor := anchors[entry.event]; anchor != nil {
 			inner, _ := anchor["hooks"].([]any)

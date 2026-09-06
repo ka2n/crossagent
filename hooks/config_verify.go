@@ -234,41 +234,32 @@ func verifyChangeSafe(before, after map[string]any, policy ownershipPolicy, allo
 		if !allowAdd {
 			return fmt.Errorf("%s would gain the entry %s, but uninstall must only remove", added.Event, added.JSON)
 		}
-		if !addedEntryOwned(added.Entry, added.Command, policy) {
-			return fmt.Errorf("%s would gain the entry %s, which is not a marked %s hook", added.Event, added.JSON, policy.toolName)
+		if !addedEntryOwned(added.Entry, added.Event, added.Command, policy) {
+			return fmt.Errorf("%s would gain the entry %s, which is not an owned %s hook", added.Event, added.JSON, policy.toolName)
 		}
 	}
 	for _, removed := range diffEntries(afterHooks, beforeHooks) {
-		marked, unmarked := deltaOwnership(removed.Entry, removed.Event, policy)
-		if !marked && !(unmarked && policy.adoptUnmarked) {
-			return fmt.Errorf("%s would lose the entry %s, which is not an explicitly owned %s hook", removed.Event, removed.JSON, policy.toolName)
+		owned, unmarked := deltaOwnership(removed.Entry, removed.Event, policy)
+		if !owned && !(unmarked && policy.adoptUnmarked) {
+			return fmt.Errorf("%s would lose the entry %s, which is not an owned %s hook", removed.Event, removed.JSON, policy.toolName)
 		}
 	}
 	return nil
 }
 
-func addedEntryOwned(raw any, command string, policy ownershipPolicy) bool {
+func addedEntryOwned(raw any, event, command string, policy ownershipPolicy) bool {
 	entry, ok := raw.(map[string]any)
 	if !ok {
 		return false
 	}
-	_, marked, hasMarker := markerFor(entry, policy.toolName)
-	if marked {
-		return true
+	if !policy.markerEnabled {
+		return predicateOwnsEntry(event, entry, command, policy)
 	}
-	if hasMarker {
-		return false
-	}
-	if policy.markerEnabled {
-		return false
-	}
-	if policy.predicate == nil {
-		return false
-	}
-	return policy.predicate(HookEntry{Command: command, Fields: cloneHookEntry(entry)})
+	_, marked, _ := markerFor(entry, policy.toolName)
+	return marked
 }
 
-func deltaOwnership(raw any, event string, policy ownershipPolicy) (marked, unmarked bool) {
+func deltaOwnership(raw any, event string, policy ownershipPolicy) (owned, unmarked bool) {
 	entry, ok := raw.(map[string]any)
 	if !ok {
 		return false, false

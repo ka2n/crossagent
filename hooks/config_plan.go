@@ -201,8 +201,8 @@ func hasOwnedEntries(settings map[string]any, policy ownershipPolicy) bool {
 				if !ok {
 					continue
 				}
-				marked, unmarked := classifyEntry(event, hook, policy)
-				if marked || (unmarked && policy.adoptUnmarked) {
+				owned, unmarked := classifyEntry(event, hook, policy)
+				if owned || (unmarked && policy.adoptUnmarked) {
 					return true
 				}
 			}

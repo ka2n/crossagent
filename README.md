@@ -13,8 +13,8 @@ It covers three fact-oriented capabilities:
 
 The path and hook packages provide the facts needed for session-location
 discovery and safe hook configuration management. Hook configuration changes
-are plan-first, marker-owned, atomic, and opt-in; live message delivery is not
-part of this library.
+are plan-first, ownership-aware, atomic, and opt-in; live message delivery is
+not part of this library.
 
 ## Scope
 
@@ -141,18 +141,24 @@ a payload into state should update fields individually rather than replacing a
 whole record.
 
 `hooks.ConfigManager` is the mutation layer for declarative Claude settings.
-Codex's compatible JSON shape is intentionally gated until its parser's marker
-tolerance is established. Call `PlanInstall` or `PlanUninstall`, present the
-returned summary and unified diff, then call `Apply` after any caller-owned
-confirmation. New
-entries carry `installedBy` and a stable per-tool ID marker. A caller-supplied
-fallback predicate can recognize unmarked legacy entries, but matching entries
-are reported as `UnmarkedOwnershipError` and are never adopted unless
-`AdoptUnmarked` is explicitly enabled. The manager preserves unrelated keys and
-wrapper fields, verifies the prospective merge, takes a per-tool backup before
-the first write, writes atomically, and can run an injected self-check probe.
-`MarkerSupportFor` reports the evidence: Claude is locally verified; Codex
-marker tolerance remains unverified and is therefore unsupported.
+Its ownership model has three layers: durable explicit markers are authoritative
+where an agent preserves them; the command predicate is authoritative where
+markers are not durable; and on marker-durable agents, predicate matches without
+a marker are reported as `UnmarkedOwnershipError` until the caller explicitly
+sets `AdoptUnmarked`. New entries carry `installedBy` and a stable per-tool ID
+marker only when `MarkerSupportFor(agent).Durable` is true.
+
+Claude Code is the measured reason for the distinction: version 2.1.259 fired
+entries containing the unknown marker keys, but its own settings writes stripped
+those keys while known fields survived (the current local version is 2.1.260).
+Claude therefore writes no marker fields and uses the predicate for ownership,
+so marker loss is not adoption churn. Codex's compatible JSON shape is
+intentionally gated until its marker tolerance is established. Call
+`PlanInstall` or `PlanUninstall`, present the returned summary and unified diff,
+then call `Apply` after any caller-owned confirmation. The manager preserves
+unrelated keys and wrapper fields, verifies the prospective merge, takes a
+per-tool backup before the first write, writes atomically, and can run an
+injected self-check probe.
 
 ## Platform and dependencies
 

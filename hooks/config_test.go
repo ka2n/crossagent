@@ -3,7 +3,6 @@ package hooks
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -72,17 +71,32 @@ func commandEntries(t *testing.T, settings map[string]any, event string) []map[s
 	return entries
 }
 
+func entryHasMarker(entry map[string]any) bool {
+	if _, ok := entry[MarkerOwnerField]; ok {
+		return true
+	}
+	for key := range entry {
+		if looksLikeMarkerIDField(key) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestMarkerSupport(t *testing.T) {
 	claude := MarkerSupportFor(AgentClaude)
-	if !claude.Supported || !claude.UnknownKeysTolerated || claude.Evidence != EvidenceObserved {
+	if !claude.Supported || !claude.UnknownKeysTolerated || claude.Durable || claude.Evidence != EvidenceObserved {
 		t.Fatalf("Claude marker support = %+v", claude)
 	}
+	if !strings.Contains(claude.Note, "2.1.260") || !strings.Contains(claude.Note, "stripped") {
+		t.Fatalf("Claude marker durability note = %q", claude.Note)
+	}
 	codex := MarkerSupportFor(AgentCodex)
-	if codex.Supported || codex.UnknownKeysTolerated {
+	if codex.Supported || codex.Durable || codex.UnknownKeysTolerated {
 		t.Fatalf("Codex marker support must remain unverified: %+v", codex)
 	}
 	pi := MarkerSupportFor(AgentPi)
-	if pi.Supported || pi.Note == "" {
+	if pi.Supported || pi.Durable || pi.Note == "" {
 		t.Fatalf("pi marker support = %+v", pi)
 	}
 	if got := MarkerIDField("my tool"); got != "x-my-tool-id" {
@@ -117,7 +131,7 @@ func TestDefaultOwnershipPredicateUnwrapsAssignmentsAndEnv(t *testing.T) {
 	}
 }
 
-func TestInstallUsesMarkersPreservesSettingsAndIsIdempotent(t *testing.T) {
+func TestInstallOmitsMarkersPreservesSettingsAndIsIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "settings.json")
 	writeConfig(t, path, map[string]any{
@@ -158,16 +172,19 @@ func TestInstallUsesMarkersPreservesSettingsAndIsIdempotent(t *testing.T) {
 	if len(entries) != 2 {
 		t.Fatalf("SessionStart entries = %#v", entries)
 	}
-	var marked map[string]any
+	var installed map[string]any
 	for _, entry := range entries {
 		if entry["command"] == "/opt/mytool start" {
-			marked = entry
+			installed = entry
 		}
 	}
-	if marked == nil || marked[MarkerOwnerField] != "mytool" || marked[MarkerIDField("mytool")] != "start" {
-		t.Fatalf("installed entry lacks markers: %#v", marked)
+	if installed == nil || entryHasMarker(installed) {
+		t.Fatalf("installed entry unexpectedly has markers: %#v", installed)
 	}
 	for _, entry := range entries {
+		if entryHasMarker(entry) {
+			t.Fatalf("Claude entry unexpectedly has marker fields: %#v", entry)
+		}
 		if entry["command"] == "other-tool start" && !reflect.DeepEqual(entry["vendor"], map[string]any{"keep": true}) {
 			t.Fatalf("foreign entry lost its unknown field: %#v", entry)
 		}
@@ -182,6 +199,7 @@ func TestInstallUsesMarkersPreservesSettingsAndIsIdempotent(t *testing.T) {
 		}
 	}
 
+	beforeSecond := stringMustRead(t, path)
 	second, err := manager.PlanInstall()
 	if err != nil {
 		t.Fatal(err)
@@ -189,9 +207,151 @@ func TestInstallUsesMarkersPreservesSettingsAndIsIdempotent(t *testing.T) {
 	if second.HasChanges || second.Summary.Added != 0 || second.Summary.Removed != 0 {
 		t.Fatalf("second install is not idempotent: %+v", second)
 	}
+	if afterSecond := stringMustRead(t, path); afterSecond != beforeSecond {
+		t.Fatalf("second install changed the file bytes:\nbefore=%q\nafter=%q", beforeSecond, afterSecond)
+	}
 }
 
-func TestInstallConvergesMarkedEntryByIDAndPreservesFlags(t *testing.T) {
+func TestPredicateOnlyInstallConvergesStalePathWithoutAdoption(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+	writeConfig(t, path, map[string]any{
+		"hooks": map[string]any{
+			"Stop": []any{map[string]any{
+				"matcher": "stop",
+				"hooks": []any{map[string]any{
+					"type": "command", "command": "/old/mytool stop --hand-edited", "async": false,
+				}},
+			}},
+		},
+	}, 0o644)
+	manager := configManager(path, "/new/mytool", HookSpec{
+		Event: EventStop, Command: "/new/mytool stop", ID: "stop",
+	})
+	plan, err := manager.PlanInstall()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Unmarked) != 0 {
+		t.Fatalf("predicate-owned entry was reported as unmarked: %#v", plan.Unmarked)
+	}
+	if !plan.HasChanges || plan.Summary.Modified != 1 || len(plan.Added) != 1 || len(plan.Removed) != 1 {
+		t.Fatalf("unexpected convergence plan: %+v", plan)
+	}
+	if err := manager.Apply(context.Background(), plan, ApplyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	entries := commandEntries(t, readConfig(t, path), "Stop")
+	if len(entries) != 1 || entries[0]["command"] != "/new/mytool stop --hand-edited" || entryHasMarker(entries[0]) {
+		t.Fatalf("predicate convergence = %#v", entries)
+	}
+	beforeSecond := stringMustRead(t, path)
+	second, err := manager.PlanInstall()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.HasChanges || len(second.Unmarked) != 0 {
+		t.Fatalf("repeated predicate install is not a no-op: %+v", second)
+	}
+	if afterSecond := stringMustRead(t, path); afterSecond != beforeSecond {
+		t.Fatalf("repeated predicate install changed bytes")
+	}
+}
+
+func TestMarkerLossDoesNotTriggerAdoptionChurn(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+	manager := configManager(path, "/opt/mytool",
+		HookSpec{Event: EventSessionStart, Command: "/opt/mytool start", ID: "start"},
+		HookSpec{Event: EventStop, Command: "/opt/mytool stop", ID: "stop"},
+	)
+	plan, err := manager.PlanInstall()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Apply(context.Background(), plan, ApplyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	settings := readConfig(t, path)
+	for _, event := range []string{"SessionStart", "Stop"} {
+		for _, entry := range commandEntries(t, settings, event) {
+			entry[MarkerOwnerField] = "mytool"
+			entry[MarkerIDField("mytool")] = event
+		}
+	}
+	writeConfig(t, path, settings, 0o644)
+	for _, event := range []string{"SessionStart", "Stop"} {
+		for _, entry := range commandEntries(t, settings, event) {
+			delete(entry, MarkerOwnerField)
+			delete(entry, MarkerIDField("mytool"))
+		}
+	}
+	writeConfig(t, path, settings, 0o644)
+
+	before := stringMustRead(t, path)
+	plan, err = manager.PlanInstall()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.HasChanges || len(plan.Unmarked) != 0 || plan.Summary.Added != 0 || plan.Summary.Removed != 0 {
+		t.Fatalf("marker loss caused adoption churn: %+v", plan)
+	}
+	if after := stringMustRead(t, path); after != before {
+		t.Fatalf("marker loss no-op changed file bytes")
+	}
+}
+
+func TestVerifyGateUsesPredicateWhenMarkersAreDisabled(t *testing.T) {
+	policy := ownershipPolicy{
+		toolName:      "mytool",
+		predicate:     DefaultOwnershipPredicate("mytool"),
+		markerEnabled: false,
+	}
+	before := map[string]any{
+		"hooks": map[string]any{"Stop": []any{map[string]any{"hooks": []any{
+			map[string]any{"type": "command", "command": "/old/mytool stop"},
+			map[string]any{"type": "command", "command": "/old/other-tool stop"},
+		}}}},
+	}
+
+	added, err := cloneSettings(before)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner := added["hooks"].(map[string]any)["Stop"].([]any)[0].(map[string]any)["hooks"].([]any)
+	inner = append(inner, map[string]any{"type": "command", "command": "/new/mytool start"})
+	added["hooks"].(map[string]any)["Stop"].([]any)[0].(map[string]any)["hooks"] = inner
+	if err := verifyChangeSafe(before, added, policy, true); err != nil {
+		t.Fatalf("predicate-owned addition rejected: %v", err)
+	}
+
+	removed, err := cloneSettings(before)
+	if err != nil {
+		t.Fatal(err)
+	}
+	removedInner := removed["hooks"].(map[string]any)["Stop"].([]any)[0].(map[string]any)["hooks"].([]any)
+	removed["hooks"].(map[string]any)["Stop"].([]any)[0].(map[string]any)["hooks"] = removedInner[1:]
+	if err := verifyChangeSafe(before, removed, policy, false); err != nil {
+		t.Fatalf("predicate-owned removal rejected: %v", err)
+	}
+
+	bad, err := cloneSettings(before)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badInner := bad["hooks"].(map[string]any)["Stop"].([]any)[0].(map[string]any)["hooks"].([]any)
+	badInner = append(badInner, map[string]any{
+		"type": "command", "command": "/old/other-tool injected",
+		MarkerOwnerField: "mytool", MarkerIDField("mytool"): "injected",
+	})
+	bad["hooks"].(map[string]any)["Stop"].([]any)[0].(map[string]any)["hooks"] = badInner
+	if err := verifyChangeSafe(before, bad, policy, true); err == nil {
+		t.Fatal("marker-bearing non-predicate addition passed the predicate-only gate")
+	}
+}
+
+func TestInstallConvergesLegacyMarkedEntryAndPreservesFlags(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "settings.json")
 	writeConfig(t, path, map[string]any{
@@ -225,8 +385,48 @@ func TestInstallConvergesMarkedEntryByIDAndPreservesFlags(t *testing.T) {
 	if entries[0]["matcher"] != nil {
 		t.Fatal("matcher unexpectedly moved into hook entry")
 	}
-	if entries[0][MarkerOwnerField] != "mytool" || entries[0][MarkerIDField("mytool")] != "stop" {
-		t.Fatalf("markers changed unexpectedly: %#v", entries[0])
+	if entryHasMarker(entries[0]) {
+		t.Fatalf("converged entry unexpectedly has markers: %#v", entries[0])
+	}
+}
+
+func TestPredicateOnlyUninstallRemovesExactlyPredicateOwnedEntries(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+	writeConfig(t, path, map[string]any{
+		"permissions": map[string]any{"deny": []any{"Bash(rm *)"}},
+		"hooks": map[string]any{
+			"Stop": []any{map[string]any{"matcher": "*", "hooks": []any{
+				map[string]any{"type": "command", "command": "/old/mytool stop"},
+				map[string]any{"type": "command", "command": "/old/mytool-other stop"},
+				map[string]any{"type": "command", "command": "/old/other-tool stop"},
+				map[string]any{"type": "prompt", "prompt": "foreign"},
+			}}},
+		},
+	}, 0o644)
+	manager := configManager(path, "")
+	plan, err := manager.PlanUninstall()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Unmarked) != 0 || !plan.HasChanges || len(plan.Removed) != 1 || plan.Removed[0].Command != "/old/mytool stop" {
+		t.Fatalf("unexpected predicate uninstall plan: %+v", plan)
+	}
+	if err := manager.Apply(context.Background(), plan, ApplyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	settings := readConfig(t, path)
+	if !reflect.DeepEqual(settings["permissions"], map[string]any{"deny": []any{"Bash(rm *)"}}) {
+		t.Fatalf("permissions changed: %#v", settings["permissions"])
+	}
+	entries := commandEntries(t, settings, "Stop")
+	if len(entries) != 3 {
+		t.Fatalf("predicate uninstall removed the wrong entries: %#v", entries)
+	}
+	for _, entry := range entries {
+		if entry["command"] == "/old/mytool stop" {
+			t.Fatal("predicate-owned entry survived uninstall")
+		}
 	}
 }
 
@@ -284,10 +484,8 @@ func TestInstallConvergenceUsesFirstOwnedWrapper(t *testing.T) {
 	}
 }
 
-func TestUnmarkedFallbackRequiresExplicitAdoptionAndWrongMarkerIsForeign(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "settings.json")
-	writeConfig(t, path, map[string]any{
+func TestDurableMarkerPolicyRequiresExplicitAdoptionAndProtectsForeignEntries(t *testing.T) {
+	settings := map[string]any{
 		"hooks": map[string]any{
 			"Stop": []any{map[string]any{"hooks": []any{
 				map[string]any{"type": "command", "command": "/old/mytool stop --legacy"},
@@ -295,41 +493,40 @@ func TestUnmarkedFallbackRequiresExplicitAdoptionAndWrongMarkerIsForeign(t *test
 				map[string]any{"type": "command", "command": "/old/mytool stop --other-marker", "x-other-tool-id": "foreign"},
 			}}},
 		},
-	}, 0o644)
-	manager := configManager(path, "/new/mytool", HookSpec{Event: EventStop, Command: "/new/mytool stop", ID: "stop"})
-	plan, err := manager.PlanInstall()
-	var ownershipErr *UnmarkedOwnershipError
-	if !errors.As(err, &ownershipErr) {
-		t.Fatalf("PlanInstall error = %v, want UnmarkedOwnershipError", err)
 	}
-	if len(plan.Unmarked) != 1 || len(ownershipErr.Entries) != 1 {
-		t.Fatalf("unmarked report = %#v / %#v", plan.Unmarked, ownershipErr.Entries)
+	policy := ownershipPolicy{
+		toolName:      "mytool",
+		predicate:     DefaultOwnershipPredicate("mytool"),
+		markerEnabled: true,
 	}
-	if got := stringMustRead(t, path); got == "" {
-		t.Fatal("settings unexpectedly disappeared")
+	if got := collectUnmarked(settings, policy); len(got) != 1 || got[0].Command != "/old/mytool stop --legacy" {
+		t.Fatalf("unmarked report = %#v", got)
 	}
 
-	manager.AdoptUnmarked = true
-	plan, err = manager.PlanInstall()
+	policy.adoptUnmarked = true
+	after, err := cloneSettings(settings)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.Apply(context.Background(), plan, ApplyOptions{}); err != nil {
+	desired := []desiredEntry{{canonical: EventStop, event: "Stop", command: "/new/mytool stop", id: "stop"}}
+	if _, _, err := convergeEntries(after, policy, "/new/mytool", desired); err != nil {
 		t.Fatal(err)
 	}
-	entries := commandEntries(t, readConfig(t, path), "Stop")
+	if err := verifyChangeSafe(settings, after, policy, true); err != nil {
+		t.Fatal(err)
+	}
+	entries := commandEntries(t, after, "Stop")
 	if len(entries) != 3 {
 		t.Fatalf("entries after adoption = %#v", entries)
 	}
 	var adopted, foreign, otherMarked map[string]any
 	for _, entry := range entries {
-		if entry["command"] == "/new/mytool stop --legacy" {
+		switch entry["command"] {
+		case "/new/mytool stop --legacy":
 			adopted = entry
-		}
-		if entry["command"] == "/old/mytool stop" {
+		case "/old/mytool stop":
 			foreign = entry
-		}
-		if entry["command"] == "/old/mytool stop --other-marker" {
+		case "/old/mytool stop --other-marker":
 			otherMarked = entry
 		}
 	}
@@ -340,20 +537,19 @@ func TestUnmarkedFallbackRequiresExplicitAdoptionAndWrongMarkerIsForeign(t *test
 		t.Fatalf("wrong-marker entry was touched: %#v / %#v", foreign, otherMarked)
 	}
 
-	uninstall := configManager(path, "")
-	uninstall.Ownership = func(HookEntry) bool { return true }
-	uninstall.AdoptUnmarked = false
-	uninstallPlan, err := uninstall.PlanUninstall()
+	beforeUninstall := after
+	uninstall, err := cloneSettings(beforeUninstall)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !uninstallPlan.HasChanges || len(uninstallPlan.Removed) != 1 {
-		t.Fatalf("uninstall did not find the marked entry: %+v", uninstallPlan)
+	removed := removeOwnedEntries(uninstall, policy)
+	if len(removed) != 1 || removed[0].Command != "/new/mytool stop --legacy" {
+		t.Fatalf("removed entries = %#v", removed)
 	}
-	if err := uninstall.Apply(context.Background(), uninstallPlan, ApplyOptions{}); err != nil {
+	if err := verifyChangeSafe(beforeUninstall, uninstall, policy, false); err != nil {
 		t.Fatal(err)
 	}
-	entries = commandEntries(t, readConfig(t, path), "Stop")
+	entries = commandEntries(t, uninstall, "Stop")
 	if len(entries) != 2 {
 		t.Fatalf("uninstall touched the wrong-marker entries: %#v", entries)
 	}
@@ -365,31 +561,30 @@ func TestUnmarkedFallbackRequiresExplicitAdoptionAndWrongMarkerIsForeign(t *test
 }
 
 func TestCustomOwnershipPredicateIsCalledWithCopy(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "settings.json")
-	writeConfig(t, path, map[string]any{
+	settings := map[string]any{
 		"hooks": map[string]any{
 			"SessionStart": []any{map[string]any{"hooks": []any{
 				map[string]any{"type": "prompt", "prompt": "legacy"},
 			}}},
 		},
-	}, 0o644)
+	}
 	called := false
-	manager := configManager(path, "/new/mytool", HookSpec{Event: EventSessionStart, Command: "/new/mytool start", ID: "start"})
-	manager.Ownership = func(entry HookEntry) bool {
-		called = true
-		entry.Fields["mutated"] = true
-		return entry.Fields["type"] == "prompt"
+	policy := ownershipPolicy{
+		toolName:      "mytool",
+		markerEnabled: true,
+		predicate: func(entry HookEntry) bool {
+			called = true
+			entry.Fields["mutated"] = true
+			return entry.Fields["type"] == "prompt"
+		},
 	}
-	plan, err := manager.PlanInstall()
-	if err == nil {
-		t.Fatal("unmarked custom match was silently adopted")
+	unmarked := collectUnmarked(settings, policy)
+	if !called || len(unmarked) != 1 {
+		t.Fatalf("custom predicate/report = called %t, %#v", called, unmarked)
 	}
-	if !called || len(plan.Unmarked) != 1 {
-		t.Fatalf("custom predicate/report = called %t, %#v, err %v", called, plan.Unmarked, err)
-	}
-	if got := commandEntries(t, readConfig(t, path), "SessionStart")[0]; got["mutated"] != nil {
-		t.Fatalf("predicate mutated settings: %#v", got)
+	entry := commandEntries(t, settings, "SessionStart")[0]
+	if entry["mutated"] != nil {
+		t.Fatalf("predicate mutated settings: %#v", entry)
 	}
 }
 

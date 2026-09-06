@@ -181,41 +181,50 @@ const (
 // layer for an owning tool name. MarkerIDField stores the stable per-entry ID.
 const MarkerOwnerField = "installedBy"
 
-// MarkerSupport describes whether an agent's configuration parser can retain
-// the explicit ownership marker used by the mutation layer. Supported refers
-// to the marker being safe to persist, not to a vendor feature or output
-// contract. OSS source that merely appears to ignore unknown keys is not
-// sufficient: support stays false until the parser behavior is established
-// for the target integration.
+// MarkerSupport describes the two separate marker facts a caller needs from
+// an agent: whether marker-bearing entries are accepted at runtime and whether
+// marker fields survive the agent's own configuration writes. Supported alone
+// is not enough to justify writing a marker; callers must consult Durable.
+// OSS source that merely appears to ignore unknown keys is not sufficient for
+// either fact: support stays false until the target integration is established.
 type MarkerSupport struct {
-	// Supported reports whether explicit markers can be written and used.
+	// Supported reports whether explicit markers are an accepted ownership
+	// mechanism at runtime. It may be true even when Durable is false.
 	Supported bool
-	// UnknownKeysTolerated reports established tolerance for the marker keys
-	// by the agent's configuration parser/runtime.
+	// Durable reports whether marker fields survive the agent's own settings
+	// writes. Callers must write marker fields only when this is true.
+	Durable bool
+	// UnknownKeysTolerated reports established read/execute-time tolerance for
+	// marker keys by the agent's hook runtime. This does not imply durability.
 	UnknownKeysTolerated bool
-	// Evidence identifies the source strength of the parser fact.
+	// Evidence identifies the source strength of the marker facts.
 	Evidence Evidence
 	// Note records version and end-to-end verification qualifications.
 	Note string
 }
 
 // MarkerSupportFor returns ownership-marker facts for agent. Claude's
-// tolerance of unknown hook-entry keys was observed locally. Codex's generic
-// hooks.json deserializer appears to ignore unknown command-entry keys in the
-// inspected OSS source, but local end-to-end tolerance is unverified, so
-// Codex remains unsupported for marker-authoritative management.
+// tolerance of unknown hook-entry keys was observed locally, but a Claude Code
+// settings write was also observed to strip those keys; Claude is therefore
+// supported for reading/firing marker-bearing entries but not for writing them.
+// Codex's generic hooks.json deserializer appears to ignore unknown
+// command-entry keys in the inspected OSS source, but local end-to-end
+// tolerance is unverified, so Codex remains unsupported for marker-authoritative
+// management.
 func MarkerSupportFor(name agent.Name) MarkerSupport {
 	switch name {
 	case AgentClaude:
 		return MarkerSupport{
 			Supported:            true,
+			Durable:              false,
 			UnknownKeysTolerated: true,
 			Evidence:             EvidenceObserved,
-			Note:                 "Claude Code 2.1.259 fired a hook entry carrying installedBy and a per-tool ID unknown key.",
+			Note:                 "Observed 2026-09-06: Claude Code 2.1.259 fired a hook entry carrying installedBy and a per-tool ID unknown key, but its /model settings write stripped those unknown keys while known fields survived. The current local claude --version is 2.1.260; markers are readable but not durable, so callers must not write them.",
 		}
 	case AgentCodex:
 		return MarkerSupport{
 			Supported:            false,
+			Durable:              false,
 			UnknownKeysTolerated: false,
 			Evidence:             EvidenceConfirmedOSS,
 			Note:                 "The inspected Codex hooks.json HookHandlerConfig deserializer appears to ignore unknown keys, but local end-to-end marker tolerance is unverified; marker management remains unsupported.",
@@ -223,6 +232,7 @@ func MarkerSupportFor(name agent.Name) MarkerSupport {
 	case AgentPi:
 		return MarkerSupport{
 			Supported:            false,
+			Durable:              false,
 			UnknownKeysTolerated: false,
 			Evidence:             EvidenceDocumented,
 			Note:                 "pi has no declarative hook configuration in which ownership markers could be stored.",
