@@ -148,10 +148,11 @@ a marker are reported as `UnmarkedOwnershipError` until the caller explicitly
 sets `AdoptUnmarked`. New entries carry `installedBy` and a stable per-tool ID
 marker only when `MarkerSupportFor(agent).Durable` is true.
 
-Claude Code is the measured reason for the distinction: version 2.1.259 fired
-entries containing the unknown marker keys, but its own settings writes stripped
-those keys while known fields survived (the current local version is 2.1.260).
-Claude therefore writes no marker fields and uses the predicate for ownership,
+Claude Code is the measured reason for the distinction: on 2026-09-04,
+version 2.1.259 fired entries containing the unknown marker keys; on 2026-09-06,
+version 2.1.260 stripped those keys during a `/model` settings write while
+known fields (`async`, `timeout`) survived. Claude therefore writes no marker
+fields and uses the predicate for ownership,
 so marker loss is not adoption churn. Codex's compatible JSON shape is
 intentionally gated until its marker tolerance is established. Call
 `PlanInstall` or `PlanUninstall`, present the returned summary and unified diff,

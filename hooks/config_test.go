@@ -88,8 +88,10 @@ func TestMarkerSupport(t *testing.T) {
 	if !claude.Supported || !claude.UnknownKeysTolerated || claude.Durable || claude.Evidence != EvidenceObserved {
 		t.Fatalf("Claude marker support = %+v", claude)
 	}
-	if !strings.Contains(claude.Note, "2.1.260") || !strings.Contains(claude.Note, "stripped") {
-		t.Fatalf("Claude marker durability note = %q", claude.Note)
+	for _, want := range []string{"2026-09-04", "2.1.259", "fired", "2026-09-06", "2.1.260", "stripped", "async", "timeout"} {
+		if !strings.Contains(claude.Note, want) {
+			t.Fatalf("Claude marker durability note lacks %q: %q", want, claude.Note)
+		}
 	}
 	codex := MarkerSupportFor(AgentCodex)
 	if codex.Supported || codex.Durable || codex.UnknownKeysTolerated {

@@ -204,9 +204,10 @@ type MarkerSupport struct {
 }
 
 // MarkerSupportFor returns ownership-marker facts for agent. Claude's
-// tolerance of unknown hook-entry keys was observed locally, but a Claude Code
-// settings write was also observed to strip those keys; Claude is therefore
-// supported for reading/firing marker-bearing entries but not for writing them.
+// read/firing observation was made on 2026-09-04 with version 2.1.259, while
+// the stripping behavior was observed on 2026-09-06 with version 2.1.260;
+// Claude is therefore supported for reading/firing marker-bearing entries but
+// not for writing them.
 // Codex's generic hooks.json deserializer appears to ignore unknown
 // command-entry keys in the inspected OSS source, but local end-to-end
 // tolerance is unverified, so Codex remains unsupported for marker-authoritative
@@ -219,7 +220,7 @@ func MarkerSupportFor(name agent.Name) MarkerSupport {
 			Durable:              false,
 			UnknownKeysTolerated: true,
 			Evidence:             EvidenceObserved,
-			Note:                 "Observed 2026-09-06: Claude Code 2.1.259 fired a hook entry carrying installedBy and a per-tool ID unknown key, but its /model settings write stripped those unknown keys while known fields survived. The current local claude --version is 2.1.260; markers are readable but not durable, so callers must not write them.",
+			Note:                 "Observed 2026-09-04 on 2.1.259: a hook entry carrying installedBy and a per-tool ID fired. Observed 2026-09-06 on 2.1.260: a /model settings write stripped those unknown keys while known fields (async, timeout) survived. Markers are readable but not durable; callers must not write them.",
 		}
 	case AgentCodex:
 		return MarkerSupport{
