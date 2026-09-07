@@ -1069,3 +1069,166 @@ func stringMustRead(t *testing.T, path string) string {
 	}
 	return string(body)
 }
+
+// asyncManager builds a Claude command-suffix manager shaped like jill's real
+// install: a fire-and-forget collect observer (async, stdout is not a protocol)
+// on PreCompact and a synchronous queue-delivery hook (stdout is a protocol) on
+// UserPromptSubmit.
+func asyncManager(path string, adopt bool) ConfigManager {
+	return ConfigManager{
+		Agent:         AgentClaude,
+		SettingsPath:  path,
+		ToolName:      "jill",
+		Invocation:    "/opt/jill",
+		MarkerStyle:   MarkerStyleCommandSuffix,
+		AdoptUnmarked: adopt,
+		Hooks: []HookSpec{
+			{Event: EventPreCompact, Command: "/opt/jill collect hook", ID: "collect", Async: true},
+			{Event: EventUserPromptSubmit, Command: "/opt/jill queue hook claude", ID: "queue"},
+		},
+	}
+}
+
+func TestAsyncSpecWritesKeyAndSyncSpecOmitsIt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	manager := asyncManager(path, false)
+	plan, err := manager.PlanInstall()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Apply(context.Background(), plan, ApplyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	settings := readConfig(t, path)
+
+	collect := commandEntries(t, settings, "PreCompact")
+	if len(collect) != 1 || collect[0]["async"] != true {
+		t.Fatalf("collect entry did not carry async:true: %#v", collect)
+	}
+	queue := commandEntries(t, settings, "UserPromptSubmit")
+	if len(queue) != 1 {
+		t.Fatalf("queue entry missing: %#v", queue)
+	}
+	if _, ok := queue[0]["async"]; ok {
+		t.Fatalf("sync queue entry unexpectedly carries an async key: %#v", queue[0])
+	}
+}
+
+func TestLegacyAsyncEntryMatchingAsyncSpecIsAccepted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	// A legacy, unmarked collect entry that a previous version left async:true.
+	writeConfig(t, path, map[string]any{
+		"hooks": map[string]any{
+			"PreCompact": []any{map[string]any{"hooks": []any{
+				map[string]any{"type": "command", "command": "/old/jill collect hook", "async": true},
+			}}},
+		},
+	}, 0o644)
+	manager := asyncManager(path, true)
+
+	plan, err := manager.PlanInstall()
+	if err != nil {
+		t.Fatalf("legacy async collect entry was refused: %v", err)
+	}
+	if err := manager.Apply(context.Background(), plan, ApplyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	collect := commandEntries(t, readConfig(t, path), "PreCompact")
+	if len(collect) != 1 {
+		t.Fatalf("collect entries after convergence = %#v", collect)
+	}
+	if collect[0]["async"] != true {
+		t.Fatalf("async was not kept on the converged collect entry: %#v", collect[0])
+	}
+	if !entryHasMarker(collect[0]) {
+		t.Fatalf("ownership marker was not added to the converged collect entry: %#v", collect[0])
+	}
+}
+
+func TestAsyncEntryMatchingSyncSpecIsRefused(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	// Someone hand-added async to the synchronous queue hook, silently breaking
+	// its stdout protocol.
+	writeConfig(t, path, map[string]any{
+		"hooks": map[string]any{
+			"UserPromptSubmit": []any{map[string]any{"hooks": []any{
+				map[string]any{"type": "command", "command": "/old/jill queue hook claude", "async": true},
+			}}},
+		},
+	}, 0o644)
+	manager := asyncManager(path, true)
+
+	_, err := manager.PlanInstall()
+	if err == nil {
+		t.Fatal("async entry on a synchronous spec was not refused")
+	}
+	for _, want := range []string{"marked async", "UserPromptSubmit", "queue hook claude"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("refusal message lacks %q: %v", want, err)
+		}
+	}
+}
+
+func TestConvergenceFlipsAsync(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	manager := asyncManager(path, false)
+	plan, err := manager.PlanInstall()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Apply(context.Background(), plan, ApplyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Flip both specs: collect becomes synchronous, queue becomes async.
+	manager.Hooks = []HookSpec{
+		{Event: EventPreCompact, Command: "/opt/jill collect hook", ID: "collect"},
+		{Event: EventUserPromptSubmit, Command: "/opt/jill queue hook claude", ID: "queue", Async: true},
+	}
+	plan, err = manager.PlanInstall()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.HasChanges || plan.Summary.Modified != 2 {
+		t.Fatalf("async flip was not reported as two modifications: %+v", plan.Summary)
+	}
+	if err := manager.Apply(context.Background(), plan, ApplyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	settings := readConfig(t, path)
+	collect := commandEntries(t, settings, "PreCompact")
+	if len(collect) != 1 {
+		t.Fatalf("collect entries = %#v", collect)
+	}
+	if _, ok := collect[0]["async"]; ok {
+		t.Fatalf("async→sync did not strip the async key: %#v", collect[0])
+	}
+	queue := commandEntries(t, settings, "UserPromptSubmit")
+	if len(queue) != 1 || queue[0]["async"] != true {
+		t.Fatalf("sync→async did not add async:true: %#v", queue)
+	}
+}
+
+func TestAsyncSyncSetIsIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	manager := asyncManager(path, false)
+	plan, err := manager.PlanInstall()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Apply(context.Background(), plan, ApplyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	before := stringMustRead(t, path)
+	second, err := manager.PlanInstall()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.HasChanges || second.Summary.Added != 0 || second.Summary.Removed != 0 || second.Summary.Modified != 0 {
+		t.Fatalf("reinstalling the async+sync set is not a no-op: %+v", second.Summary)
+	}
+	if after := stringMustRead(t, path); after != before {
+		t.Fatalf("reinstall changed the file bytes:\nbefore=%q\nafter=%q", before, after)
+	}
+}

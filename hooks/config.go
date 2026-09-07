@@ -21,11 +21,15 @@ import (
 // to execute; ConfigManager adds the selected ownership suffix, if any. ID is
 // a stable per-entry identifier. Supplying an ID is recommended, especially
 // when one event has multiple commands; a deterministic event/action ID is
-// generated when it is omitted.
+// generated when it is omitted. Async marks a fire-and-forget observer whose
+// stdout is not a protocol: the written entry carries "async": true. Leave it
+// false for a synchronous hook whose stdout is a protocol; no async key is
+// written in that case.
 type HookSpec struct {
 	Event   Event
 	Command string
 	ID      string
+	Async   bool
 }
 
 // HookEntry is the read-only view passed to a Matcher. Command is the clean
@@ -167,6 +171,7 @@ type desiredEntry struct {
 	event     string
 	command   string
 	id        string
+	async     bool
 }
 
 type ownershipPolicy struct {
@@ -299,6 +304,7 @@ func (c managerConfig) desired() ([]desiredEntry, []string, error) {
 			event:     agentEvent,
 			command:   command,
 			id:        id,
+			async:     spec.Async,
 		})
 	}
 	return entries, order, nil
@@ -792,12 +798,28 @@ func collectUnmarked(settings map[string]any, policy ownershipPolicy) []Unmarked
 	return out
 }
 
-func asyncOwnedEntries(settings map[string]any, policy ownershipPolicy) []UnmarkedEntry {
+// ownedRef is one owned entry discovered in the current settings, in the order
+// convergence walks the file. It records the facts the async guard and the
+// desired-spec mapping need without re-parsing the raw hook object.
+type ownedRef struct {
+	event   string
+	command string
+	action  string
+	id      string
+	marked  bool
+	async   bool
+}
+
+// collectOwnedRefs returns every entry the tool owns (a valid marker, or a
+// fallback matcher match adopted under the active style). The traversal order
+// matches convergeEntries so a legacy entry maps to the same desired spec that
+// convergence would reuse it for.
+func collectOwnedRefs(settings map[string]any, policy ownershipPolicy) []ownedRef {
 	hooks := hooksSection(settings, false)
 	if hooks == nil {
 		return nil
 	}
-	var out []UnmarkedEntry
+	var out []ownedRef
 	for _, event := range sortedKeys(hooks) {
 		groups, _ := hooks[event].([]any)
 		for _, rawGroup := range groups {
@@ -812,10 +834,93 @@ func asyncOwnedEntries(settings map[string]any, policy ownershipPolicy) []Unmark
 					continue
 				}
 				owned, unmarked := classifyEntry(event, hook, policy)
-				if (owned || unmarked) && hookBool(hook, "async") {
-					out = append(out, UnmarkedEntry{Event: event, Command: entryCommand(hook)})
+				if !owned && !(unmarked && policy.adoptUnmarked) {
+					continue
 				}
+				command := entryCommand(hook)
+				id, marked, _ := markerFor(hook, policy.toolName)
+				out = append(out, ownedRef{
+					event:   event,
+					command: command,
+					action:  actionKey(command),
+					id:      id,
+					marked:  marked,
+					async:   hookBool(hook, "async"),
+				})
 			}
+		}
+	}
+	return out
+}
+
+// asyncSyncConflicts returns async entries this install cannot safely make
+// synchronous. The hazard it protects against is a hook whose stdout is a
+// protocol (additionalContext/decision) being backgrounded, which silently
+// discards that protocol.
+//
+// An entry crossagent already owns through its own suffix/field marker is
+// trusted to convergence: convergeEntries rewrites its async state to match the
+// declared spec, so a marker-owned async entry is flipped to synchronous (async
+// key stripped) or kept async as the spec dictates, and the change is visible in
+// the plan diff. Those are never reported here, which is what lets a tool flip
+// one of its own hooks from async to sync across installs.
+//
+// The remaining case is an async entry with no crossagent marker that the
+// fallback matcher adopts (only reachable with AdoptUnmarked). Such an entry was
+// authored outside crossagent; converging it to synchronous would silently
+// strip a human's async edit. It is accepted only when it maps to a desired spec
+// that is itself async (the legacy-observer case, e.g. an old "collect hook"
+// entry); it is refused when it maps to a synchronous spec or to no desired spec
+// at all. The desired-spec mapping mirrors convergeEntries: a marked entry pairs
+// with the desired spec sharing its marker ID, and an unmarked entry pairs by
+// event and action in declaration order.
+func asyncSyncConflicts(settings map[string]any, policy ownershipPolicy, desired []desiredEntry) []UnmarkedEntry {
+	owned := collectOwnedRefs(settings, policy)
+	if len(owned) == 0 {
+		return nil
+	}
+	byID := map[string]int{}
+	legacyByAction := map[string][]int{}
+	for index, ref := range owned {
+		if ref.marked {
+			if _, exists := byID[ref.id]; !exists {
+				byID[ref.id] = index
+			}
+			continue
+		}
+		key := ref.event + "\x00" + ref.action
+		legacyByAction[key] = append(legacyByAction[key], index)
+	}
+	specForOwned := make(map[int]desiredEntry, len(owned))
+	usedIDs := map[string]bool{}
+	usedActions := map[string]int{}
+	for _, spec := range desired {
+		matched := -1
+		if index, ok := byID[spec.id]; ok && !usedIDs[spec.id] {
+			matched = index
+			usedIDs[spec.id] = true
+		}
+		if matched < 0 {
+			key := spec.event + "\x00" + actionKey(spec.command)
+			cursor := usedActions[key]
+			if cursor < len(legacyByAction[key]) {
+				matched = legacyByAction[key][cursor]
+				usedActions[key] = cursor + 1
+			}
+		}
+		if matched >= 0 {
+			specForOwned[matched] = spec
+		}
+	}
+	var out []UnmarkedEntry
+	for index, ref := range owned {
+		if !ref.async || ref.marked {
+			// Marker-owned async entries are converged to match the spec, so
+			// they are never a conflict; only foreign-authored async edits are.
+			continue
+		}
+		if spec, ok := specForOwned[index]; !ok || !spec.async {
+			out = append(out, UnmarkedEntry{Event: ref.event, Command: ref.command})
 		}
 	}
 	return out
@@ -827,10 +932,23 @@ func hookBool(entry map[string]any, key string) bool {
 }
 
 func newHookEntry(entry desiredEntry, toolName string, markerStyle MarkerStyle) map[string]any {
-	return map[string]any{
+	hook := map[string]any{
 		"type":    "command",
 		"command": commandForMarkerStyle(entry.command, toolName, entry.id, markerStyle),
 	}
+	applyAsyncField(hook, entry.async)
+	return hook
+}
+
+// applyAsyncField makes the entry's async state match a desired spec. Claude's
+// schema treats a present "async": true as the async flag and an absent key as
+// synchronous, so a sync spec omits the key entirely rather than writing false.
+func applyAsyncField(hook map[string]any, async bool) {
+	if async {
+		hook["async"] = true
+		return
+	}
+	delete(hook, "async")
 }
 
 // stripOwnershipMarkers removes both current suffix metadata and legacy field
@@ -1054,6 +1172,10 @@ func convergeEntries(settings map[string]any, policy ownershipPolicy, desired []
 			stripOwnershipMarkers(hook)
 			command = commandForMarkerStyle(entry.command, policy.toolName, entry.id, policy.markerStyle)
 			hook["command"] = command
+			// The async state is governed by the spec, not preserved from the
+			// old entry: a converged async spec keeps async:true, a sync spec
+			// drops any stale async key.
+			applyAsyncField(hook, entry.async)
 		} else {
 			hook = newHookEntry(entry, policy.toolName, policy.markerStyle)
 			command = entryCommand(hook)

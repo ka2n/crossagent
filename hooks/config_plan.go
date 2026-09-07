@@ -130,9 +130,6 @@ func (m ConfigManager) plan(operation ChangeOperation) (ChangePlan, error) {
 	if len(plan.Unmarked) > 0 && !c.adoptUnmarked {
 		return plan, &UnmarkedOwnershipError{ToolName: c.toolName, Entries: cloneUnmarked(plan.Unmarked)}
 	}
-	if async := asyncOwnedEntries(before, policy); len(async) > 0 {
-		return plan, fmt.Errorf("refusing to manage %s: an owned hook is marked async; remove async or explicitly repair it first (%s)", path, formatUnmarked(async))
-	}
 
 	after, err := cloneSettings(before)
 	if err != nil {
@@ -146,6 +143,9 @@ func (m ConfigManager) plan(operation ChangeOperation) (ChangePlan, error) {
 			return plan, desiredErr
 		}
 		order = desiredOrder
+		if conflicts := asyncSyncConflicts(before, policy, desired); len(conflicts) > 0 {
+			return plan, fmt.Errorf("refusing to manage %s: an owned hook is marked async but is managed as a synchronous hook whose stdout is a protocol; remove async or explicitly repair it first (%s)", path, formatUnmarked(conflicts))
+		}
 		if len(desired) == 0 {
 			// An empty install declaration is a no-op. Removal is explicit via
 			// PlanUninstall, rather than an accidental consequence of a nil
@@ -228,7 +228,11 @@ func formatUnmarked(entries []UnmarkedEntry) string {
 	if len(entries) == 0 {
 		return "none"
 	}
-	return entries[0].Event + ": " + entries[0].Command
+	parts := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		parts = append(parts, entry.Event+": "+entry.Command)
+	}
+	return strings.Join(parts, "; ")
 }
 
 func diffEntriesWithTool(from, to map[string]any, toolName string) []entryDelta {
