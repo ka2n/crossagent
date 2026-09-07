@@ -151,7 +151,7 @@ func (m ConfigManager) plan(operation ChangeOperation) (ChangePlan, error) {
 			// PlanUninstall, rather than an accidental consequence of a nil
 			// desired slice.
 		} else if hasOwnedEntries(before, policy) {
-			if _, _, err := convergeEntries(after, policy, c.invocation, desired); err != nil {
+			if _, _, err := convergeEntries(after, policy, desired); err != nil {
 				return plan, err
 			}
 		} else if err := mergeDesired(after, desired, policy); err != nil {

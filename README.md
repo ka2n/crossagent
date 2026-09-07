@@ -144,23 +144,51 @@ whole record.
 hook configuration. `MarkerStyle` has exactly two write styles:
 `MarkerStyleCommandSuffix` appends a trailing ` #crossagent:v1:<base64url(tool)>:<base64url(id)>`
 shell comment to the command, while `MarkerStyleNone` writes no marker and
-uses predicate-only ownership for unmarked entries. The zero value and `MarkerStyleAuto` choose the suffix when
-`MarkerSupportFor(agent).Supported` establishes shell execution, and otherwise
-choose none. Forcing a suffix when that fact is false is rejected during
-planning; forcing none is the no-marker write mode, with the predicate used for
-otherwise unmarked entries. The suffix is stored in the known command field,
-not as extra JSON keys. `BuildCommandSuffixMarker`,
-`ParseCommandSuffixMarker`, and `StripCommandSuffixMarker` implement the exact
-format and ignore quoted or escaped `#` strings.
+uses the matcher for unmarked entries. The zero value and `MarkerStyleAuto`
+choose the suffix when `MarkerSupportFor(agent).Supported` establishes shell
+execution, and otherwise choose none. Forcing a suffix when that fact is false
+is rejected during planning; forcing none is the no-marker write mode. The
+suffix is stored in the known command field, not as extra JSON keys.
+`BuildCommandSuffixMarker`, `ParseCommandSuffixMarker`, and
+`StripCommandSuffixMarker` implement the exact format and ignore quoted or
+escaped `#` strings.
+
+`ConfigManager.Matcher` is the composable fallback ownership vocabulary. Its
+zero value is `MatchBasename(ToolName)`, which compares only argv[0]'s basename
+and does not unwrap anything. `MatchPattern(expr)` applies a regexp to the
+suffix-stripped clean command; unanchored patterns are a footgun, so prefer an
+anchored expression such as `^/opt/mytool(?:\s|$)`. `MatchEnvWrapped(m)`
+explicitly opts into recognizing leading `VAR=value` assignments and a leading
+`env` with its common flags, then delegates to `m`. `MatchAny`, `MatchAll`, and
+`MatchFunc` provide OR, AND, and a raw `HookEntry` escape hatch. Every matcher
+gets the clean command, while `HookEntry.Fields` retains the complete entry for
+field-sensitive functions.
+
+Unwrapping is opt-in because in `env X=1 tool ...`, `tool` is env's argument;
+claiming it by default risks clobbering a hand-tuned wrapper when convergence
+rewrites the entry. A matcher-recognized entry is converged to the declared
+`HookSpec.Command` verbatim (with the selected ownership suffix); wrapper
+preservation is not attempted. Declare the wrapper in `HookSpec.Command` if it
+should remain. For example, a binary rename can bridge both spellings while
+converging to the new one:
+
+```go
+manager := hooks.ConfigManager{
+    ToolName:   "newtool",
+    Matcher:    hooks.MatchAny(hooks.MatchBasename("oldtool"), hooks.MatchBasename("newtool")),
+    Invocation: "/opt/newtool",
+    Hooks:      []hooks.HookSpec{{Event: hooks.EventStop, Command: "/opt/newtool collect"}},
+}
+```
 
 A suffix (or an old, recognized JSON marker) is authoritative. With suffix
-style, predicate matches without a marker are reported as
+style, matcher matches without a marker are reported as
 `UnmarkedOwnershipError` until the caller explicitly sets `AdoptUnmarked`.
-With none style, otherwise unmarked predicate matches are owned directly;
+With none style, otherwise unmarked matcher matches are owned directly;
 existing valid markers still remain authoritative while they are converged.
-The old `installedBy`/`x-<tool>-id` fields are not an API style and are never written;
-they are read only so an existing install can be converged or removed safely.
-Only entries already owned by the caller may gain or lose a suffix.
+The old `installedBy`/`x-<tool>-id` fields are not an API style and are never
+written; they are read only so an existing install can be converged or removed
+safely. Only entries already owned by the caller may gain or lose a suffix.
 
 The per-agent facts are evidence-backed. Claude Code suffix execution was
 verified live on 2026-09-07 with version 2.1.260: a SessionStart command with

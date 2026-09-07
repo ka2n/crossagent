@@ -28,48 +28,17 @@ type HookSpec struct {
 	ID      string
 }
 
-// HookEntry is the read-only view passed to an OwnershipPredicate. Fields is a
-// copy of the complete hook-entry object, including unknown vendor fields.
+// HookEntry is the read-only view passed to a Matcher. Command is the clean
+// command with a valid suffix marker removed; Fields is a copy of the complete
+// raw hook-entry object, including unknown vendor fields.
 type HookEntry struct {
 	Event   string
 	Command string
 	Fields  map[string]any
 }
 
-// OwnershipPredicate recognizes entries by their command and fields when
-// explicit markers are unavailable. A command-suffix marker (or a recognized
-// legacy JSON marker) is authoritative; with command-suffix style, a predicate
-// match without either marker is an unmarked legacy entry and requires
-// AdoptUnmarked. With none style, the predicate is the ownership authority and
-// an unmarked match is owned directly. The Command passed to the predicate is
-// stripped of a valid suffix; Fields remains a copy of the raw entry. The
-// default predicate is DefaultOwnershipPredicate.
-type OwnershipPredicate func(HookEntry) bool
-
-// DefaultOwnershipPredicate returns the conservative legacy matcher for a
-// tool name. It removes leading VAR=value assignments and a leading env
-// command (including its common flags) before comparing the executable's
-// basename. It therefore recognizes wrappers such as
-// "env MY_TOOL_MODE=1 mytool collect hook" without using a loose string
-// prefix.
-func DefaultOwnershipPredicate(toolName string) OwnershipPredicate {
-	toolName = strings.TrimSpace(toolName)
-	return func(entry HookEntry) bool {
-		command, _ := StripCommandSuffixMarker(entry.Command)
-		words, err := parseShellWords(command)
-		if err != nil {
-			return false
-		}
-		index := commandExecutableIndex(words)
-		if index < 0 || index >= len(words) {
-			return false
-		}
-		return commandBase(words[index].Text) == toolName
-	}
-}
-
 // UnmarkedEntry describes a command that matches the fallback ownership
-// predicate but carries no valid suffix or legacy marker. Such entries are
+// matcher but carries no valid suffix or legacy marker. Such entries are
 // reported when command-suffix style is selected and are never adopted
 // silently.
 type UnmarkedEntry struct {
@@ -120,11 +89,17 @@ type ApplyOptions struct {
 }
 
 // ConfigManager plans and applies changes to a JSON hook configuration file.
-// MarkerStyle selects command-suffix ownership, predicate-only ownership, or
-// the auto default. Auto writes a suffix when MarkerSupportFor says hook
-// commands are shell-executed and otherwise writes no marker. The old JSON
-// field markers are never written; they are recognized only as read-only
-// legacy ownership metadata and are removed while converging an owned entry.
+// MarkerStyle selects command-suffix ownership, matcher-only ownership, or the
+// auto default. Auto writes a suffix when MarkerSupportFor says hook commands
+// are shell-executed and otherwise writes no marker. The old JSON field
+// markers are never written; they are recognized only as read-only legacy
+// ownership metadata and are removed while converging an owned entry.
+// Matcher is the fallback ownership vocabulary for unmarked entries; its zero
+// value is MatchBasename(ToolName). Convergence writes the declared
+// HookSpec.Command (plus the selected ownership suffix) rather than preserving
+// wrapper text or hand-edited command flags. In particular, an entry matched
+// through MatchEnvWrapped can lose its wrapper unless the wrapper is declared
+// in HookSpec.Command. The plan diff shows that replacement.
 // Claude's settings.json and Codex's hooks.json are supported; pi has no
 // declarative hook file. The manager never prompts or prints. Call
 // PlanInstall/PlanUninstall, show the returned data, obtain any user
@@ -155,16 +130,19 @@ type ConfigManager struct {
 	// MarkerStyle controls ownership recording. The zero value and
 	// MarkerStyleAuto select the per-agent default. MarkerStyleCommandSuffix
 	// is the command-comment marker; MarkerStyleNone writes no marker and uses
-	// the predicate for otherwise unmarked entries. Existing valid markers stay
+	// the matcher for otherwise unmarked entries. Existing valid markers stay
 	// authoritative while they are converged. The old JSON field-marker style
 	// is intentionally not exposed.
 	MarkerStyle MarkerStyle
 
-	// Ownership recognizes entries by command when no valid ownership marker is
-	// available. A nil predicate uses the default basename predicate for
-	// ToolName. With command-suffix style, matches without a marker require
-	// AdoptUnmarked; with none style, unmarked matches are owned directly.
-	Ownership OwnershipPredicate
+	// Matcher recognizes entries when no valid ownership marker is available.
+	// A nil matcher uses MatchBasename(ToolName), which examines only argv[0]
+	// and does not unwrap assignments or env. With command-suffix style, matches
+	// without a marker require AdoptUnmarked; with none style, unmarked matches
+	// are owned directly. MatchEnvWrapped is an explicit opt-in: convergence
+	// still writes HookSpec.Command verbatim rather than preserving a recognized
+	// wrapper.
+	Matcher Matcher
 	// AdoptUnmarked is the explicit safety opt-in for fallback-only matches when
 	// command-suffix markers are selected. It has no effect with none style.
 	AdoptUnmarked bool
@@ -179,7 +157,7 @@ type managerConfig struct {
 	scope         paths.Scope
 	toolName      string
 	invocation    string
-	predicate     OwnershipPredicate
+	matcher       Matcher
 	adoptUnmarked bool
 	markerStyle   MarkerStyle
 }
@@ -193,7 +171,7 @@ type desiredEntry struct {
 
 type ownershipPolicy struct {
 	toolName      string
-	predicate     OwnershipPredicate
+	matcher       Matcher
 	adoptUnmarked bool
 	markerStyle   MarkerStyle
 }
@@ -230,9 +208,12 @@ func (m ConfigManager) config() (managerConfig, error) {
 	} else if len(m.Hooks) > 0 {
 		return managerConfig{}, errors.New("hook configuration requires an invocation for install plans")
 	}
-	predicate := m.Ownership
-	if predicate == nil {
-		predicate = DefaultOwnershipPredicate(toolName)
+	matcher := m.Matcher
+	if matcher == nil {
+		matcher = MatchBasename(toolName)
+	}
+	if err := validateMatcher(matcher); err != nil {
+		return managerConfig{}, fmt.Errorf("invalid hook matcher: %w", err)
 	}
 	scope := m.Scope
 	if scope == "" {
@@ -244,7 +225,7 @@ func (m ConfigManager) config() (managerConfig, error) {
 		scope:         scope,
 		toolName:      toolName,
 		invocation:    invocation,
-		predicate:     predicate,
+		matcher:       matcher,
 		adoptUnmarked: m.AdoptUnmarked,
 		markerStyle:   markerStyle,
 	}, nil
@@ -253,7 +234,7 @@ func (m ConfigManager) config() (managerConfig, error) {
 func (c managerConfig) policy() ownershipPolicy {
 	return ownershipPolicy{
 		toolName:      c.toolName,
-		predicate:     c.predicate,
+		matcher:       c.matcher,
 		adoptUnmarked: c.adoptUnmarked,
 		markerStyle:   c.markerStyle,
 	}
@@ -284,8 +265,8 @@ func (c managerConfig) desired() ([]desiredEntry, []string, error) {
 	order := make([]string, 0, len(c.manager.Hooks))
 	usedIDs := map[string]bool{}
 	for index, spec := range c.manager.Hooks {
-		command := strings.TrimSpace(spec.Command)
-		if command == "" {
+		command := spec.Command
+		if strings.TrimSpace(command) == "" {
 			return nil, nil, fmt.Errorf("hook %d has an empty command", index)
 		}
 		agentEvent, ok := FromCanonical(c.agent, spec.Event)
@@ -361,7 +342,7 @@ func containsString(values []string, want string) bool {
 // The returned plan contains the real diff and entry summary for presentation
 // by a caller. A non-nil plan may accompany an error so an unmarked-entry
 // report can still be inspected when command-suffix style is selected; none
-// style treats predicate matches as owned directly.
+// style treats matcher matches as owned directly.
 func (m ConfigManager) PlanInstall() (ChangePlan, error) {
 	return m.plan(operationInstall)
 }
@@ -650,19 +631,6 @@ func splitArgv0(command string) (argv0, rest string) {
 	return trimmed[words[0].Start:words[0].End], trimmed[words[0].End:]
 }
 
-func rewriteCommandExecutable(command, invocation string) string {
-	command, _ = StripCommandSuffixMarker(command)
-	words, err := parseShellWords(command)
-	if err != nil {
-		return command
-	}
-	index := commandExecutableIndex(words)
-	if index < 0 || index >= len(words) {
-		return command
-	}
-	return command[:words[index].Start] + invocation + command[words[index].End:]
-}
-
 // actionKey identifies the subcommand portion of a command while ignoring
 // flags. The executable may be wrapped in assignments or env; this is why it
 // does not use strings.Fields.
@@ -757,12 +725,12 @@ func cloneHookEntry(raw map[string]any) map[string]any {
 	return out
 }
 
-func predicateOwnsEntry(event string, raw map[string]any, command string, policy ownershipPolicy) bool {
-	if policy.predicate == nil {
+func matcherOwnsEntry(event string, raw map[string]any, command string, policy ownershipPolicy) bool {
+	if matcherIsNil(policy.matcher) {
 		return false
 	}
 	command, _ = StripCommandSuffixMarker(command)
-	return policy.predicate(HookEntry{Event: event, Command: command, Fields: cloneHookEntry(raw)})
+	return policy.matcher.Match(HookEntry{Event: event, Command: command, Fields: cloneHookEntry(raw)})
 }
 
 func entryCommand(entry map[string]any) string {
@@ -786,7 +754,7 @@ func classifyEntry(event string, raw map[string]any, policy ownershipPolicy) (ow
 	if hasMarker {
 		return marked, false
 	}
-	if !predicateOwnsEntry(event, raw, entryCommand(raw), policy) {
+	if !matcherOwnsEntry(event, raw, entryCommand(raw), policy) {
 		return false, false
 	}
 	if policy.markerStyle == MarkerStyleCommandSuffix {
@@ -974,7 +942,7 @@ func markerIDForChange(entry map[string]any, toolName string) string {
 	return ""
 }
 
-func convergeEntries(settings map[string]any, policy ownershipPolicy, invocation string, desired []desiredEntry) (added, removed []EntryChange, err error) {
+func convergeEntries(settings map[string]any, policy ownershipPolicy, desired []desiredEntry) (added, removed []EntryChange, err error) {
 	hooks := hooksSection(settings, true)
 	if hooks == nil {
 		return nil, nil, errors.New(`the settings file has a "hooks" key that is not an object`)
@@ -1079,16 +1047,12 @@ func convergeEntries(settings map[string]any, policy ownershipPolicy, invocation
 		command := entry.command
 		if old != nil {
 			hook = cloneHookEntry(old.value)
-			if strings.TrimSpace(old.command) != "" && actionKey(old.command) == actionKey(entry.command) {
-				// Preserve hand-edited flags only while the stable entry
-				// still denotes the same action. A changed action is a real
-				// caller request, so use the declared command verbatim.
-				command = rewriteCommandExecutable(old.command, invocation)
-			}
 			// Remove any old suffix or JSON-field metadata before applying
-			// the style selected for this install.
+			// the style selected for this install. The declared command is
+			// authoritative; wrapper text and hand-edited flags from the old
+			// command are not preserved.
 			stripOwnershipMarkers(hook)
-			command = commandForMarkerStyle(command, policy.toolName, entry.id, policy.markerStyle)
+			command = commandForMarkerStyle(entry.command, policy.toolName, entry.id, policy.markerStyle)
 			hook["command"] = command
 		} else {
 			hook = newHookEntry(entry, policy.toolName, policy.markerStyle)

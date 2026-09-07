@@ -23,7 +23,7 @@ const (
 	MarkerStyleCommandSuffix MarkerStyle = "command-suffix"
 	// MarkerStyleSuffix is a concise alias for MarkerStyleCommandSuffix.
 	MarkerStyleSuffix = MarkerStyleCommandSuffix
-	// MarkerStyleNone records no new marker and uses the ownership predicate.
+	// MarkerStyleNone records no new marker and uses the ownership matcher.
 	MarkerStyleNone MarkerStyle = "none"
 )
 
@@ -215,7 +215,7 @@ func commandForMarkerStyle(command string, toolName, id string, style MarkerStyl
 	if style == MarkerStyleCommandSuffix {
 		return BuildCommandSuffixMarker(command, toolName, id)
 	}
-	return strings.TrimSpace(command)
+	return command
 }
 
 func resolveMarkerStyle(requested MarkerStyle, name agent.Name) (MarkerStyle, error) {
