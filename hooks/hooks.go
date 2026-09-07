@@ -13,7 +13,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/ka2n/crossagent/agent"
 )
@@ -177,92 +176,52 @@ const (
 	EvidenceObserved Evidence = "observed"
 )
 
-// MarkerOwnerField is the JSON key used by the configuration-management
-// layer for an owning tool name. MarkerIDField stores the stable per-entry ID.
-const MarkerOwnerField = "installedBy"
-
-// MarkerSupport describes the two separate marker facts a caller needs from
-// an agent: whether marker-bearing entries are accepted at runtime and whether
-// marker fields survive the agent's own configuration writes. Supported alone
-// is not enough to justify writing a marker; callers must consult Durable.
-// OSS source that merely appears to ignore unknown keys is not sufficient for
-// either fact: support stays false until the target integration is established.
+// MarkerSupport describes whether command-suffix ownership markers are safe
+// for an agent. Supported means that the agent's hook runner is established to
+// execute command strings through a shell, so a trailing shell comment cannot
+// become a literal argv argument. It says nothing about the abandoned JSON
+// field-marker mechanism: Claude's field markers were observed to fire but not
+// survive settings writes, and Codex field-marker tolerance was never relied on.
 type MarkerSupport struct {
-	// Supported reports whether explicit markers are an accepted ownership
-	// mechanism at runtime. It may be true even when Durable is false.
+	// Supported reports whether a command-suffix marker is safe to write for
+	// this agent.
 	Supported bool
-	// Durable reports whether marker fields survive the agent's own settings
-	// writes. Callers must write marker fields only when this is true.
-	Durable bool
-	// UnknownKeysTolerated reports established read/execute-time tolerance for
-	// marker keys by the agent's hook runtime. This does not imply durability.
-	UnknownKeysTolerated bool
-	// Evidence identifies the source strength of the marker facts.
+	// Evidence identifies the source strength of the suffix fact.
 	Evidence Evidence
-	// Note records version and end-to-end verification qualifications.
+	// Note records the execution evidence and any write-preservation
+	// qualification behind Supported.
 	Note string
 }
 
-// MarkerSupportFor returns ownership-marker facts for agent. Claude's
-// read/firing observation was made on 2026-09-04 with version 2.1.259, while
-// the stripping behavior was observed on 2026-09-06 with version 2.1.260;
-// Claude is therefore supported for reading/firing marker-bearing entries but
-// not for writing them.
-// Codex's generic hooks.json deserializer appears to ignore unknown
-// command-entry keys in the inspected OSS source, but local end-to-end
-// tolerance is unverified, so Codex remains unsupported for marker-authoritative
-// management.
+// MarkerSupportFor returns command-suffix marker facts for agent. Claude's
+// suffix execution was verified live on 2026-09-07 with version 2.1.260. The
+// older JSON-field observations remain in Claude's note because they explain
+// why fields are retained only as read-only legacy metadata. Codex's suffix
+// safety is established from the inspected open-source command runner at the
+// recorded commit. pi has no declarative hooks.
 func MarkerSupportFor(name agent.Name) MarkerSupport {
 	switch name {
 	case AgentClaude:
 		return MarkerSupport{
-			Supported:            true,
-			Durable:              false,
-			UnknownKeysTolerated: true,
-			Evidence:             EvidenceObserved,
-			Note:                 "Observed 2026-09-04 on 2.1.259: a hook entry carrying installedBy and a per-tool ID fired. Observed 2026-09-06 on 2.1.260: a /model settings write stripped those unknown keys while known fields (async, timeout) survived. Markers are readable but not durable; callers must not write them.",
+			Supported: true,
+			Evidence:  EvidenceObserved,
+			Note:      "Live 2026-09-07 run with claude 2.1.260 installed a SessionStart command ending in a #crossagent:v1:<base64url(tool)>:<base64url(id)> suffix; the hook wrote its marker file and claude -p returned exactly OK. This also agrees with the observed command forms (env assignments, quoted paths, and bash scripts) showing shell execution. Field-marker context: on 2026-09-04 with 2.1.259 an installedBy/x-<tool>-id entry fired, while on 2026-09-06 with 2.1.260 a /model write stripped those unknown keys and kept known fields including command, async, and timeout. Suffix write-preservation is reasoned from command being a known field that survived verbatim, not directly measured in that run.",
 		}
 	case AgentCodex:
 		return MarkerSupport{
-			Supported:            false,
-			Durable:              false,
-			UnknownKeysTolerated: false,
-			Evidence:             EvidenceConfirmedOSS,
-			Note:                 "The inspected Codex hooks.json HookHandlerConfig deserializer appears to ignore unknown keys, but local end-to-end marker tolerance is unverified; marker management remains unsupported.",
+			Supported: true,
+			Evidence:  EvidenceConfirmedOSS,
+			Note:      "Inspected 2026-09-07 at openai/codex commit 0df39752cbc4b88d0194ec62bdb0d56fbda4b014: codex-rs/hooks/src/engine/command_runner.rs run_command passes each configured command to build_command, which uses the configured shell or /bin/sh -lc and supplies the complete command string as one shell argument. A command suffix is therefore shell syntax rather than a literal hook argument. This establishes execution safety; suffix write-preservation is a separate configuration-contract fact.",
 		}
 	case AgentPi:
 		return MarkerSupport{
-			Supported:            false,
-			Durable:              false,
-			UnknownKeysTolerated: false,
-			Evidence:             EvidenceDocumented,
-			Note:                 "pi has no declarative hook configuration in which ownership markers could be stored.",
+			Supported: false,
+			Evidence:  EvidenceDocumented,
+			Note:      "pi has no declarative hook configuration in which a command-suffix marker could be stored.",
 		}
 	default:
 		return MarkerSupport{}
 	}
-}
-
-// MarkerIDField returns the per-tool JSON key used for a stable hook-entry
-// identifier. For example, MarkerIDField("mytool") is "x-mytool-id". Tool
-// names are reduced to a safe, deterministic token.
-func MarkerIDField(toolName string) string {
-	var token strings.Builder
-	for _, r := range strings.ToLower(strings.TrimSpace(toolName)) {
-		switch {
-		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
-			token.WriteRune(r)
-		default:
-			if token.Len() == 0 || !strings.HasSuffix(token.String(), "-") {
-				token.WriteByte('-')
-			}
-		}
-	}
-	name := strings.Trim(token.String(), "-")
-	if name == "" {
-		name = "tool"
-	}
-	return "x-" + name + "-id"
 }
 
 var claudeEvents = []Event{

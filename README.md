@@ -140,26 +140,47 @@ non-object JSON are errors. Missing fields remain zero values; callers merging
 a payload into state should update fields individually rather than replacing a
 whole record.
 
-`hooks.ConfigManager` is the mutation layer for declarative Claude settings.
-Its ownership model has three layers: durable explicit markers are authoritative
-where an agent preserves them; the command predicate is authoritative where
-markers are not durable; and on marker-durable agents, predicate matches without
-a marker are reported as `UnmarkedOwnershipError` until the caller explicitly
-sets `AdoptUnmarked`. New entries carry `installedBy` and a stable per-tool ID
-marker only when `MarkerSupportFor(agent).Durable` is true.
+`hooks.ConfigManager` is the mutation layer for declarative Claude and Codex
+hook configuration. `MarkerStyle` has exactly two write styles:
+`MarkerStyleCommandSuffix` appends a trailing ` #crossagent:v1:<base64url(tool)>:<base64url(id)>`
+shell comment to the command, while `MarkerStyleNone` writes no marker and
+uses predicate-only ownership for unmarked entries. The zero value and `MarkerStyleAuto` choose the suffix when
+`MarkerSupportFor(agent).Supported` establishes shell execution, and otherwise
+choose none. Forcing a suffix when that fact is false is rejected during
+planning; forcing none is the no-marker write mode, with the predicate used for
+otherwise unmarked entries. The suffix is stored in the known command field,
+not as extra JSON keys. `BuildCommandSuffixMarker`,
+`ParseCommandSuffixMarker`, and `StripCommandSuffixMarker` implement the exact
+format and ignore quoted or escaped `#` strings.
 
-Claude Code is the measured reason for the distinction: on 2026-09-04,
-version 2.1.259 fired entries containing the unknown marker keys; on 2026-09-06,
-version 2.1.260 stripped those keys during a `/model` settings write while
-known fields (`async`, `timeout`) survived. Claude therefore writes no marker
-fields and uses the predicate for ownership,
-so marker loss is not adoption churn. Codex's compatible JSON shape is
-intentionally gated until its marker tolerance is established. Call
-`PlanInstall` or `PlanUninstall`, present the returned summary and unified diff,
-then call `Apply` after any caller-owned confirmation. The manager preserves
-unrelated keys and wrapper fields, verifies the prospective merge, takes a
-per-tool backup before the first write, writes atomically, and can run an
-injected self-check probe.
+A suffix (or an old, recognized JSON marker) is authoritative. With suffix
+style, predicate matches without a marker are reported as
+`UnmarkedOwnershipError` until the caller explicitly sets `AdoptUnmarked`.
+With none style, otherwise unmarked predicate matches are owned directly;
+existing valid markers still remain authoritative while they are converged.
+The old `installedBy`/`x-<tool>-id` fields are not an API style and are never written;
+they are read only so an existing install can be converged or removed safely.
+Only entries already owned by the caller may gain or lose a suffix.
+
+The per-agent facts are evidence-backed. Claude Code suffix execution was
+verified live on 2026-09-07 with version 2.1.260: a SessionStart command with
+the suffix wrote its temporary file and `claude -p` returned exactly
+`OK`. The reason JSON fields were abandoned is also measured: on 2026-09-04,
+version 2.1.259 fired entries containing the unknown fields; on 2026-09-06,
+version 2.1.260 stripped them during a `/model` settings write while known
+fields, including `command`, `async`, and `timeout`, survived. Suffix
+write-preservation is therefore reasoned from `command` being known, not
+claimed as a separate direct observation. Codex suffix execution is confirmed
+at openai/codex commit
+`0df39752cbc4b88d0194ec62bdb0d56fbda4b014`: its command runner passes hook
+commands to a configured shell or `/bin/sh -lc`. pi has no declarative hooks.
+
+Call `PlanInstall` or `PlanUninstall`, present the returned summary and unified
+diff, then call `Apply` after any caller-owned confirmation. The manager
+preserves unrelated keys and wrapper fields, verifies the prospective merge,
+takes a per-tool backup before the first write, writes atomically, and can run
+an injected self-check probe. Probes always use a clean direct argv vector;
+the ownership suffix belongs only to the configured shell command.
 
 ## Platform and dependencies
 

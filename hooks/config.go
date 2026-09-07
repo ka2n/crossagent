@@ -17,10 +17,11 @@ import (
 
 // HookSpec declares one hook a caller wants to manage. Event is expressed in
 // the canonical vocabulary from this package; ConfigManager maps it to the
-// exact spelling accepted by the selected agent. ID is a stable per-entry
-// identifier. Supplying an ID is recommended, especially when one event has
-// multiple commands; a deterministic event/action ID is generated when it is
-// omitted.
+// exact spelling accepted by the selected agent. Command is the clean command
+// to execute; ConfigManager adds the selected ownership suffix, if any. ID is
+// a stable per-entry identifier. Supplying an ID is recommended, especially
+// when one event has multiple commands; a deterministic event/action ID is
+// generated when it is omitted.
 type HookSpec struct {
 	Event   Event
 	Command string
@@ -36,10 +37,13 @@ type HookEntry struct {
 }
 
 // OwnershipPredicate recognizes entries by their command and fields when
-// explicit markers are unavailable. For marker-durable agents, a predicate
-// match is an unmarked legacy entry and requires AdoptUnmarked. For agents
-// without durable markers, the predicate is the ownership authority and a
-// match is owned directly. The default predicate is DefaultOwnershipPredicate.
+// explicit markers are unavailable. A command-suffix marker (or a recognized
+// legacy JSON marker) is authoritative; with command-suffix style, a predicate
+// match without either marker is an unmarked legacy entry and requires
+// AdoptUnmarked. With none style, the predicate is the ownership authority and
+// an unmarked match is owned directly. The Command passed to the predicate is
+// stripped of a valid suffix; Fields remains a copy of the raw entry. The
+// default predicate is DefaultOwnershipPredicate.
 type OwnershipPredicate func(HookEntry) bool
 
 // DefaultOwnershipPredicate returns the conservative legacy matcher for a
@@ -51,7 +55,8 @@ type OwnershipPredicate func(HookEntry) bool
 func DefaultOwnershipPredicate(toolName string) OwnershipPredicate {
 	toolName = strings.TrimSpace(toolName)
 	return func(entry HookEntry) bool {
-		words, err := parseShellWords(entry.Command)
+		command, _ := StripCommandSuffixMarker(entry.Command)
+		words, err := parseShellWords(command)
 		if err != nil {
 			return false
 		}
@@ -64,8 +69,9 @@ func DefaultOwnershipPredicate(toolName string) OwnershipPredicate {
 }
 
 // UnmarkedEntry describes a command that matches the fallback ownership
-// predicate but carries no valid explicit marker. Such entries are reported
-// only for agents whose markers are durable, and are never adopted silently.
+// predicate but carries no valid suffix or legacy marker. Such entries are
+// reported when command-suffix style is selected and are never adopted
+// silently.
 type UnmarkedEntry struct {
 	Event   string
 	Command string
@@ -73,7 +79,8 @@ type UnmarkedEntry struct {
 
 // UnmarkedOwnershipError reports legacy-looking entries that require explicit
 // adoption before they can be removed, rewritten, or treated as installed by
-// an agent with durable markers. Marker-less agents do not produce this error.
+// a command-suffix-style manager. None-style managers do not produce this
+// error.
 type UnmarkedOwnershipError struct {
 	ToolName string
 	Entries  []UnmarkedEntry
@@ -89,9 +96,11 @@ func (e *UnmarkedOwnershipError) Error() string {
 }
 
 // Probe describes a self-check command that proves the exact hook executable
-// is usable before a configuration write. Command is an argv vector and is
-// run directly, never through a shell. The caller supplies ExpectedToken
-// because only the caller knows what proves its binary works.
+// is usable before a configuration write. Command is an argv vector for the
+// clean executable invocation and is run directly, never through a shell. The
+// ownership suffix belongs only in the settings command string; it must not be
+// added to Probe.Command. The caller supplies ExpectedToken because only the
+// caller knows what proves its binary works.
 type Probe struct {
 	Command       []string
 	ExpectedToken string
@@ -111,19 +120,20 @@ type ApplyOptions struct {
 }
 
 // ConfigManager plans and applies changes to a JSON hook configuration file.
-// Claude's settings.json is supported, but its marker keys are not durable:
-// ownership therefore uses the predicate and Claude entries are written
-// without markers. Codex's hooks.json shape is understood by the path and
-// hook-fact packages, but configuration mutation remains rejected until its
-// marker tolerance is established; pi has no declarative hook file. The
-// manager never prompts or prints. Call PlanInstall/PlanUninstall, show the
-// returned data, obtain any user confirmation in the caller, then call Apply.
+// MarkerStyle selects command-suffix ownership, predicate-only ownership, or
+// the auto default. Auto writes a suffix when MarkerSupportFor says hook
+// commands are shell-executed and otherwise writes no marker. The old JSON
+// field markers are never written; they are recognized only as read-only
+// legacy ownership metadata and are removed while converging an owned entry.
+// Claude's settings.json and Codex's hooks.json are supported; pi has no
+// declarative hook file. The manager never prompts or prints. Call
+// PlanInstall/PlanUninstall, show the returned data, obtain any user
+// confirmation in the caller, then call Apply.
 type ConfigManager struct {
 	// Resolver supplies home and environment lookup behavior for scope paths.
 	Resolver paths.Resolver
 	// Agent is the canonical agent name. Configuration mutation accepts
-	// AgentClaude; Claude uses predicate ownership because its marker fields are
-	// not durable. Codex remains gated by marker-support evidence.
+	// Claude and Codex; pi has no declarative hook file.
 	Agent agent.Name
 	// Scope selects the user, project, or local configuration path. Empty
 	// means paths.ScopeUser.
@@ -139,17 +149,24 @@ type ConfigManager struct {
 	// Invocation is the current executable spelling used as argv[0] in new
 	// command strings. It may be a shell-quoted path, but must name ToolName.
 	Invocation string
-	// Hooks declares the desired canonical events and command strings.
+	// Hooks declares the desired canonical events and clean command strings.
 	Hooks []HookSpec
 
-	// Ownership recognizes entries by command when marker ownership is not
+	// MarkerStyle controls ownership recording. The zero value and
+	// MarkerStyleAuto select the per-agent default. MarkerStyleCommandSuffix
+	// is the command-comment marker; MarkerStyleNone writes no marker and uses
+	// the predicate for otherwise unmarked entries. Existing valid markers stay
+	// authoritative while they are converged. The old JSON field-marker style
+	// is intentionally not exposed.
+	MarkerStyle MarkerStyle
+
+	// Ownership recognizes entries by command when no valid ownership marker is
 	// available. A nil predicate uses the default basename predicate for
-	// ToolName. For marker-durable agents, matches without a marker require
-	// AdoptUnmarked; for marker-less agents, matches are owned directly.
+	// ToolName. With command-suffix style, matches without a marker require
+	// AdoptUnmarked; with none style, unmarked matches are owned directly.
 	Ownership OwnershipPredicate
-	// AdoptUnmarked is the explicit safety opt-in for fallback-only matches on
-	// marker-durable agents. It has no effect when predicate ownership is the
-	// agent's authority.
+	// AdoptUnmarked is the explicit safety opt-in for fallback-only matches when
+	// command-suffix markers are selected. It has no effect with none style.
 	AdoptUnmarked bool
 	// Probe is run before a changed install plan is written. Uninstall plans
 	// do not run it.
@@ -164,7 +181,7 @@ type managerConfig struct {
 	invocation    string
 	predicate     OwnershipPredicate
 	adoptUnmarked bool
-	markerEnabled bool
+	markerStyle   MarkerStyle
 }
 
 type desiredEntry struct {
@@ -178,7 +195,7 @@ type ownershipPolicy struct {
 	toolName      string
 	predicate     OwnershipPredicate
 	adoptUnmarked bool
-	markerEnabled bool
+	markerStyle   MarkerStyle
 }
 
 const (
@@ -188,15 +205,15 @@ const (
 
 func (m ConfigManager) config() (managerConfig, error) {
 	name := m.Agent
+	markerStyle, err := resolveMarkerStyle(m.MarkerStyle, name)
+	if err != nil {
+		return managerConfig{}, err
+	}
 	if name != AgentClaude && name != AgentCodex {
 		if name == AgentPi {
 			return managerConfig{}, errors.New("pi has no declarative hook configuration; load a JavaScript extension instead")
 		}
 		return managerConfig{}, fmt.Errorf("unsupported hook configuration agent %q", m.Agent)
-	}
-	markerSupport := MarkerSupportFor(name)
-	if !markerSupport.Supported {
-		return managerConfig{}, fmt.Errorf("hook configuration for %s is unsupported until ownership-marker tolerance is established: %s", name, markerSupport.Note)
 	}
 	toolName := strings.TrimSpace(m.ToolName)
 	if toolName == "" {
@@ -229,7 +246,7 @@ func (m ConfigManager) config() (managerConfig, error) {
 		invocation:    invocation,
 		predicate:     predicate,
 		adoptUnmarked: m.AdoptUnmarked,
-		markerEnabled: markerSupport.Durable,
+		markerStyle:   markerStyle,
 	}, nil
 }
 
@@ -238,7 +255,7 @@ func (c managerConfig) policy() ownershipPolicy {
 		toolName:      c.toolName,
 		predicate:     c.predicate,
 		adoptUnmarked: c.adoptUnmarked,
-		markerEnabled: c.markerEnabled,
+		markerStyle:   c.markerStyle,
 	}
 }
 
@@ -343,8 +360,8 @@ func containsString(values []string, want string) bool {
 // PlanInstall reads and validates the prospective install without writing.
 // The returned plan contains the real diff and entry summary for presentation
 // by a caller. A non-nil plan may accompany an error so an unmarked-entry
-// report can still be inspected for agents whose markers are durable; agents
-// without durable markers treat predicate matches as owned directly.
+// report can still be inspected when command-suffix style is selected; none
+// style treats predicate matches as owned directly.
 func (m ConfigManager) PlanInstall() (ChangePlan, error) {
 	return m.plan(operationInstall)
 }
@@ -396,7 +413,7 @@ func (m ConfigManager) Apply(ctx context.Context, plan ChangePlan, options Apply
 	if err != nil {
 		return err
 	}
-	if plan.path != path || plan.operation == "" || plan.agent != c.agent || plan.toolName != c.toolName || plan.invocation != c.invocation {
+	if plan.path != path || plan.operation == "" || plan.agent != c.agent || plan.toolName != c.toolName || plan.invocation != c.invocation || plan.markerStyle != c.markerStyle {
 		return errors.New("change plan belongs to a different configuration manager")
 	}
 	if !plan.HasChanges {
@@ -624,6 +641,7 @@ func commandBase(value string) string {
 }
 
 func splitArgv0(command string) (argv0, rest string) {
+	command, _ = StripCommandSuffixMarker(command)
 	trimmed := strings.TrimLeft(command, " \t\n\r")
 	words, err := parseShellWords(trimmed)
 	if err != nil || len(words) == 0 {
@@ -633,6 +651,7 @@ func splitArgv0(command string) (argv0, rest string) {
 }
 
 func rewriteCommandExecutable(command, invocation string) string {
+	command, _ = StripCommandSuffixMarker(command)
 	words, err := parseShellWords(command)
 	if err != nil {
 		return command
@@ -648,6 +667,7 @@ func rewriteCommandExecutable(command, invocation string) string {
 // flags. The executable may be wrapped in assignments or env; this is why it
 // does not use strings.Fields.
 func actionKey(command string) string {
+	command, _ = StripCommandSuffixMarker(command)
 	words, err := parseShellWords(command)
 	if err != nil {
 		return ""
@@ -741,6 +761,7 @@ func predicateOwnsEntry(event string, raw map[string]any, command string, policy
 	if policy.predicate == nil {
 		return false
 	}
+	command, _ = StripCommandSuffixMarker(command)
 	return policy.predicate(HookEntry{Event: event, Command: command, Fields: cloneHookEntry(raw)})
 }
 
@@ -749,48 +770,29 @@ func entryCommand(entry map[string]any) string {
 	return command
 }
 
+// markerFor checks the command suffix first because it is the current
+// authoritative marker. The legacy JSON fields are checked only when no valid
+// suffix is present; they are read-only compatibility metadata and are never
+// emitted by this package.
 func markerFor(entry map[string]any, toolName string) (id string, marked bool, hasMarker bool) {
-	owner, ownerPresent := entry[MarkerOwnerField]
-	idValue, idPresent := entry[MarkerIDField(toolName)]
-	hasMarker = ownerPresent || idPresent
-	if !hasMarker {
-		for key := range entry {
-			if looksLikeMarkerIDField(key) {
-				hasMarker = true
-				break
-			}
-		}
+	if _, owner, suffixID, ok := ParseCommandSuffixMarker(entryCommand(entry)); ok {
+		return suffixID, owner == toolName, true
 	}
-	if !hasMarker {
-		return "", false, false
-	}
-	ownerName, ownerOK := owner.(string)
-	id, idOK := idValue.(string)
-	if ownerOK && ownerName == toolName && idOK && strings.TrimSpace(id) != "" {
-		return strings.TrimSpace(id), true, true
-	}
-	return "", false, true
-}
-
-func looksLikeMarkerIDField(key string) bool {
-	return strings.HasPrefix(key, "x-") && strings.HasSuffix(key, "-id") && len(key) > len("x--id")
+	return legacyMarkerFor(entry, toolName)
 }
 
 func classifyEntry(event string, raw map[string]any, policy ownershipPolicy) (owned, unmarked bool) {
-	if !policy.markerEnabled {
-		if predicateOwnsEntry(event, raw, entryCommand(raw), policy) {
-			return true, false
-		}
-		return false, false
-	}
 	_, marked, hasMarker := markerFor(raw, policy.toolName)
 	if hasMarker {
 		return marked, false
 	}
-	if predicateOwnsEntry(event, raw, entryCommand(raw), policy) {
+	if !predicateOwnsEntry(event, raw, entryCommand(raw), policy) {
+		return false, false
+	}
+	if policy.markerStyle == MarkerStyleCommandSuffix {
 		return false, true
 	}
-	return false, false
+	return true, false
 }
 
 func collectUnmarked(settings map[string]any, policy ownershipPolicy) []UnmarkedEntry {
@@ -856,19 +858,23 @@ func hookBool(entry map[string]any, key string) bool {
 	return value
 }
 
-func newHookEntry(entry desiredEntry, toolName string, markerEnabled bool) map[string]any {
-	hook := map[string]any{"type": "command", "command": entry.command}
-	if markerEnabled {
-		hook[MarkerOwnerField] = toolName
-		hook[MarkerIDField(toolName)] = entry.id
+func newHookEntry(entry desiredEntry, toolName string, markerStyle MarkerStyle) map[string]any {
+	return map[string]any{
+		"type":    "command",
+		"command": commandForMarkerStyle(entry.command, toolName, entry.id, markerStyle),
 	}
-	return hook
 }
 
-func stripMarkerFields(entry map[string]any) {
-	delete(entry, MarkerOwnerField)
+// stripOwnershipMarkers removes both current suffix metadata and legacy field
+// metadata from an entry already classified as owned. Callers must not use it
+// on foreign entries: removing a suffix changes their command.
+func stripOwnershipMarkers(entry map[string]any) {
+	if command, stripped := StripCommandSuffixMarker(entryCommand(entry)); stripped {
+		entry["command"] = command
+	}
+	delete(entry, legacyMarkerOwnerField)
 	for key := range entry {
-		if looksLikeMarkerIDField(key) {
+		if looksLikeLegacyMarkerIDField(key) {
 			delete(entry, key)
 		}
 	}
@@ -885,7 +891,7 @@ func mergeDesired(settings map[string]any, desired []desiredEntry, policy owners
 		if !containsString(order, entry.event) {
 			order = append(order, entry.event)
 		}
-		byEvent[entry.event] = append(byEvent[entry.event], newHookEntry(entry, policy.toolName, policy.markerEnabled))
+		byEvent[entry.event] = append(byEvent[entry.event], newHookEntry(entry, policy.toolName, policy.markerStyle))
 	}
 	for _, event := range order {
 		inner := byEvent[event]
@@ -1022,15 +1028,10 @@ func convergeEntries(settings map[string]any, policy ownershipPolicy, invocation
 				ownedInGroup = true
 				command := entryCommand(hook)
 				old := oldEntry{event: event, command: command, action: actionKey(command), value: cloneHookEntry(hook)}
-				if policy.markerEnabled {
-					if id, isMarked, _ := markerFor(hook, policy.toolName); isMarked {
-						old.id = id
-						if _, exists := byID[id]; !exists {
-							byID[id] = old
-						}
-					} else {
-						key := event + "\x00" + old.action
-						legacyByAction[key] = append(legacyByAction[key], old)
+				if id, isMarked, _ := markerFor(hook, policy.toolName); isMarked {
+					old.id = id
+					if _, exists := byID[id]; !exists {
+						byID[id] = old
 					}
 				} else {
 					key := event + "\x00" + old.action
@@ -1084,15 +1085,14 @@ func convergeEntries(settings map[string]any, policy ownershipPolicy, invocation
 				// caller request, so use the declared command verbatim.
 				command = rewriteCommandExecutable(old.command, invocation)
 			}
+			// Remove any old suffix or JSON-field metadata before applying
+			// the style selected for this install.
+			stripOwnershipMarkers(hook)
+			command = commandForMarkerStyle(command, policy.toolName, entry.id, policy.markerStyle)
 			hook["command"] = command
 		} else {
-			hook = newHookEntry(entry, policy.toolName, policy.markerEnabled)
-		}
-		if policy.markerEnabled {
-			hook[MarkerOwnerField] = policy.toolName
-			hook[MarkerIDField(policy.toolName)] = entry.id
-		} else {
-			stripMarkerFields(hook)
+			hook = newHookEntry(entry, policy.toolName, policy.markerStyle)
+			command = entryCommand(hook)
 		}
 		if anchor := anchors[entry.event]; anchor != nil {
 			inner, _ := anchor["hooks"].([]any)

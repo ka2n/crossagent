@@ -16,6 +16,7 @@ func configManager(path, invocation string, specs ...HookSpec) ConfigManager {
 		SettingsPath: path,
 		ToolName:     "mytool",
 		Invocation:   invocation,
+		MarkerStyle:  MarkerStyleNone,
 		Hooks:        specs,
 	}
 }
@@ -71,43 +72,55 @@ func commandEntries(t *testing.T, settings map[string]any, event string) []map[s
 	return entries
 }
 
-func entryHasMarker(entry map[string]any) bool {
-	if _, ok := entry[MarkerOwnerField]; ok {
+func entryHasLegacyMarker(entry map[string]any) bool {
+	if _, ok := entry[legacyMarkerOwnerField]; ok {
 		return true
 	}
 	for key := range entry {
-		if looksLikeMarkerIDField(key) {
+		if looksLikeLegacyMarkerIDField(key) {
 			return true
 		}
 	}
 	return false
 }
 
+func entryHasMarker(entry map[string]any) bool {
+	if _, _, _, ok := ParseCommandSuffixMarker(entryCommand(entry)); ok {
+		return true
+	}
+	return entryHasLegacyMarker(entry)
+}
+
 func TestMarkerSupport(t *testing.T) {
 	claude := MarkerSupportFor(AgentClaude)
-	if !claude.Supported || !claude.UnknownKeysTolerated || claude.Durable || claude.Evidence != EvidenceObserved {
-		t.Fatalf("Claude marker support = %+v", claude)
+	if !claude.Supported || claude.Evidence != EvidenceObserved || claude.Note == "" {
+		t.Fatalf("Claude suffix support = %+v", claude)
 	}
-	for _, want := range []string{"2026-09-04", "2.1.259", "fired", "2026-09-06", "2.1.260", "stripped", "async", "timeout"} {
+	for _, want := range []string{"2026-09-04", "2.1.259", "fired", "2026-09-06", "2.1.260", "stripped", "command", "async", "timeout", "2026-09-07"} {
 		if !strings.Contains(claude.Note, want) {
-			t.Fatalf("Claude marker durability note lacks %q: %q", want, claude.Note)
+			t.Fatalf("Claude suffix note lacks %q: %q", want, claude.Note)
 		}
 	}
 	codex := MarkerSupportFor(AgentCodex)
-	if codex.Supported || codex.Durable || codex.UnknownKeysTolerated {
-		t.Fatalf("Codex marker support must remain unverified: %+v", codex)
+	if !codex.Supported || codex.Evidence != EvidenceConfirmedOSS || !strings.Contains(codex.Note, "0df39752cbc4b88d0194ec62bdb0d56fbda4b014") || !strings.Contains(codex.Note, "/bin/sh -lc") {
+		t.Fatalf("Codex suffix support = %+v", codex)
 	}
 	pi := MarkerSupportFor(AgentPi)
-	if pi.Supported || pi.Durable || pi.Note == "" {
+	if pi.Supported || pi.Note == "" {
 		t.Fatalf("pi marker support = %+v", pi)
 	}
-	if got := MarkerIDField("my tool"); got != "x-my-tool-id" {
-		t.Fatalf("MarkerIDField = %q", got)
+	if got := legacyMarkerIDField("my tool"); got != "x-my-tool-id" {
+		t.Fatalf("legacyMarkerIDField = %q", got)
 	}
 
-	manager := ConfigManager{Agent: AgentCodex, ToolName: "mytool", Invocation: "mytool"}
-	if _, err := manager.PlanInstall(); err == nil || !strings.Contains(err.Error(), "marker") {
-		t.Fatalf("Codex configuration mutation was accepted: %v", err)
+	path := filepath.Join(t.TempDir(), "hooks.json")
+	manager := ConfigManager{Agent: AgentCodex, SettingsPath: path, ToolName: "mytool", Invocation: "mytool", Hooks: []HookSpec{{Event: EventSessionStart, Command: "mytool start", ID: "start"}}}
+	plan, err := manager.PlanInstall()
+	if err != nil {
+		t.Fatalf("Codex configuration mutation failed: %v", err)
+	}
+	if plan.Style != MarkerStyleCommandSuffix {
+		t.Fatalf("Codex auto style = %q", plan.Style)
 	}
 }
 
@@ -117,6 +130,7 @@ func TestDefaultOwnershipPredicateUnwrapsAssignmentsAndEnv(t *testing.T) {
 		"DEBUG=1 /usr/local/bin/mytool hook",
 		"env DEBUG=1 --unset OLD /usr/local/bin/mytool hook --flag",
 		`env 'DEBUG=1' "/usr/local/bin/mytool" hook`,
+		BuildCommandSuffixMarker("/usr/local/bin/mytool hook", "mytool", "hook"),
 	} {
 		if !owns(HookEntry{Command: command}) {
 			t.Errorf("predicate did not recognize %q", command)
@@ -133,7 +147,7 @@ func TestDefaultOwnershipPredicateUnwrapsAssignmentsAndEnv(t *testing.T) {
 	}
 }
 
-func TestInstallOmitsMarkersPreservesSettingsAndIsIdempotent(t *testing.T) {
+func TestNoneStyleInstallPreservesSettingsAndIsIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "settings.json")
 	writeConfig(t, path, map[string]any{
@@ -278,15 +292,15 @@ func TestMarkerLossDoesNotTriggerAdoptionChurn(t *testing.T) {
 	settings := readConfig(t, path)
 	for _, event := range []string{"SessionStart", "Stop"} {
 		for _, entry := range commandEntries(t, settings, event) {
-			entry[MarkerOwnerField] = "mytool"
-			entry[MarkerIDField("mytool")] = event
+			entry[legacyMarkerOwnerField] = "mytool"
+			entry[legacyMarkerIDField("mytool")] = event
 		}
 	}
 	writeConfig(t, path, settings, 0o644)
 	for _, event := range []string{"SessionStart", "Stop"} {
 		for _, entry := range commandEntries(t, settings, event) {
-			delete(entry, MarkerOwnerField)
-			delete(entry, MarkerIDField("mytool"))
+			delete(entry, legacyMarkerOwnerField)
+			delete(entry, legacyMarkerIDField("mytool"))
 		}
 	}
 	writeConfig(t, path, settings, 0o644)
@@ -304,11 +318,11 @@ func TestMarkerLossDoesNotTriggerAdoptionChurn(t *testing.T) {
 	}
 }
 
-func TestVerifyGateUsesPredicateWhenMarkersAreDisabled(t *testing.T) {
+func TestVerifyGateUsesPredicateWithNoneStyle(t *testing.T) {
 	policy := ownershipPolicy{
-		toolName:      "mytool",
-		predicate:     DefaultOwnershipPredicate("mytool"),
-		markerEnabled: false,
+		toolName:    "mytool",
+		predicate:   DefaultOwnershipPredicate("mytool"),
+		markerStyle: MarkerStyleNone,
 	}
 	before := map[string]any{
 		"hooks": map[string]any{"Stop": []any{map[string]any{"hooks": []any{
@@ -345,7 +359,7 @@ func TestVerifyGateUsesPredicateWhenMarkersAreDisabled(t *testing.T) {
 	badInner := bad["hooks"].(map[string]any)["Stop"].([]any)[0].(map[string]any)["hooks"].([]any)
 	badInner = append(badInner, map[string]any{
 		"type": "command", "command": "/old/other-tool injected",
-		MarkerOwnerField: "mytool", MarkerIDField("mytool"): "injected",
+		legacyMarkerOwnerField: "mytool", legacyMarkerIDField("mytool"): "injected",
 	})
 	bad["hooks"].(map[string]any)["Stop"].([]any)[0].(map[string]any)["hooks"] = badInner
 	if err := verifyChangeSafe(before, bad, policy, true); err == nil {
@@ -362,7 +376,7 @@ func TestInstallConvergesLegacyMarkedEntryAndPreservesFlags(t *testing.T) {
 				"matcher": "stop",
 				"hooks": []any{map[string]any{
 					"type": "command", "command": "/old/mytool stop --hand-edited", "async": false,
-					MarkerOwnerField: "mytool", MarkerIDField("mytool"): "stop",
+					legacyMarkerOwnerField: "mytool", legacyMarkerIDField("mytool"): "stop",
 				}},
 			}},
 		},
@@ -437,7 +451,7 @@ func TestMarkedIDWithChangedActionUsesDeclaredCommand(t *testing.T) {
 	path := filepath.Join(dir, "settings.json")
 	writeConfig(t, path, map[string]any{
 		"hooks": map[string]any{"Stop": []any{map[string]any{"hooks": []any{
-			map[string]any{"type": "command", "command": "/old/mytool old-action --manual", MarkerOwnerField: "mytool", MarkerIDField("mytool"): "stable"},
+			map[string]any{"type": "command", "command": "/old/mytool old-action --manual", legacyMarkerOwnerField: "mytool", legacyMarkerIDField("mytool"): "stable"},
 		}}}},
 	}, 0o644)
 	manager := configManager(path, "/new/mytool", HookSpec{Event: EventStop, Command: "/new/mytool new-action", ID: "stable"})
@@ -460,10 +474,10 @@ func TestInstallConvergenceUsesFirstOwnedWrapper(t *testing.T) {
 	writeConfig(t, path, map[string]any{
 		"hooks": map[string]any{"Stop": []any{
 			map[string]any{"matcher": "first", "hooks": []any{
-				map[string]any{"type": "command", "command": "/old/mytool stop", MarkerOwnerField: "mytool", MarkerIDField("mytool"): "old-1"},
+				map[string]any{"type": "command", "command": "/old/mytool stop", legacyMarkerOwnerField: "mytool", legacyMarkerIDField("mytool"): "old-1"},
 			}},
 			map[string]any{"matcher": "second", "hooks": []any{
-				map[string]any{"type": "command", "command": "/older/mytool stop", MarkerOwnerField: "mytool", MarkerIDField("mytool"): "old-2"},
+				map[string]any{"type": "command", "command": "/older/mytool stop", legacyMarkerOwnerField: "mytool", legacyMarkerIDField("mytool"): "old-2"},
 			}},
 		}},
 	}, 0o644)
@@ -486,20 +500,20 @@ func TestInstallConvergenceUsesFirstOwnedWrapper(t *testing.T) {
 	}
 }
 
-func TestDurableMarkerPolicyRequiresExplicitAdoptionAndProtectsForeignEntries(t *testing.T) {
+func TestSuffixMarkerPolicyRequiresExplicitAdoptionAndProtectsForeignEntries(t *testing.T) {
 	settings := map[string]any{
 		"hooks": map[string]any{
 			"Stop": []any{map[string]any{"hooks": []any{
 				map[string]any{"type": "command", "command": "/old/mytool stop --legacy"},
-				map[string]any{"type": "command", "command": "/old/mytool stop", MarkerOwnerField: "other", MarkerIDField("mytool"): "foreign"},
+				map[string]any{"type": "command", "command": "/old/mytool stop", legacyMarkerOwnerField: "other", legacyMarkerIDField("mytool"): "foreign"},
 				map[string]any{"type": "command", "command": "/old/mytool stop --other-marker", "x-other-tool-id": "foreign"},
 			}}},
 		},
 	}
 	policy := ownershipPolicy{
-		toolName:      "mytool",
-		predicate:     DefaultOwnershipPredicate("mytool"),
-		markerEnabled: true,
+		toolName:    "mytool",
+		predicate:   DefaultOwnershipPredicate("mytool"),
+		markerStyle: MarkerStyleCommandSuffix,
 	}
 	if got := collectUnmarked(settings, policy); len(got) != 1 || got[0].Command != "/old/mytool stop --legacy" {
 		t.Fatalf("unmarked report = %#v", got)
@@ -523,19 +537,23 @@ func TestDurableMarkerPolicyRequiresExplicitAdoptionAndProtectsForeignEntries(t 
 	}
 	var adopted, foreign, otherMarked map[string]any
 	for _, entry := range entries {
-		switch entry["command"] {
-		case "/new/mytool stop --legacy":
+		clean, owner, id, marked := ParseCommandSuffixMarker(entryCommand(entry))
+		switch {
+		case marked && clean == "/new/mytool stop --legacy":
 			adopted = entry
-		case "/old/mytool stop":
+		case clean == "/old/mytool stop":
 			foreign = entry
-		case "/old/mytool stop --other-marker":
+		case clean == "/old/mytool stop --other-marker":
 			otherMarked = entry
 		}
+		if marked && clean == "/new/mytool stop --legacy" && (owner != "mytool" || id != "stop" || entryHasLegacyMarker(entry)) {
+			t.Fatalf("adopted entry retained invalid metadata: %#v", entry)
+		}
 	}
-	if adopted == nil || adopted[MarkerOwnerField] != "mytool" || adopted[MarkerIDField("mytool")] != "stop" {
-		t.Fatalf("legacy entry was not explicitly adopted: %#v", adopted)
+	if adopted == nil {
+		t.Fatalf("legacy entry was not explicitly adopted: %#v", entries)
 	}
-	if foreign == nil || foreign[MarkerOwnerField] != "other" || otherMarked == nil {
+	if foreign == nil || foreign[legacyMarkerOwnerField] != "other" || otherMarked == nil {
 		t.Fatalf("wrong-marker entry was touched: %#v / %#v", foreign, otherMarked)
 	}
 
@@ -545,7 +563,7 @@ func TestDurableMarkerPolicyRequiresExplicitAdoptionAndProtectsForeignEntries(t 
 		t.Fatal(err)
 	}
 	removed := removeOwnedEntries(uninstall, policy)
-	if len(removed) != 1 || removed[0].Command != "/new/mytool stop --legacy" {
+	if len(removed) != 1 || removed[0].Command != "/new/mytool stop --legacy #crossagent:v1:bXl0b29s:c3RvcA" {
 		t.Fatalf("removed entries = %#v", removed)
 	}
 	if err := verifyChangeSafe(beforeUninstall, uninstall, policy, false); err != nil {
@@ -556,7 +574,8 @@ func TestDurableMarkerPolicyRequiresExplicitAdoptionAndProtectsForeignEntries(t 
 		t.Fatalf("uninstall touched the wrong-marker entries: %#v", entries)
 	}
 	for _, entry := range entries {
-		if entry["command"] == "/new/mytool stop --legacy" {
+		clean, _, _, marked := ParseCommandSuffixMarker(entryCommand(entry))
+		if marked && clean == "/new/mytool stop --legacy" {
 			t.Fatal("adopted entry survived uninstall")
 		}
 	}
@@ -572,8 +591,8 @@ func TestCustomOwnershipPredicateIsCalledWithCopy(t *testing.T) {
 	}
 	called := false
 	policy := ownershipPolicy{
-		toolName:      "mytool",
-		markerEnabled: true,
+		toolName:    "mytool",
+		markerStyle: MarkerStyleCommandSuffix,
 		predicate: func(entry HookEntry) bool {
 			called = true
 			entry.Fields["mutated"] = true
@@ -762,15 +781,306 @@ func TestVerifyGatePreservesForeignWrapperAndTopLevelValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	after["user"] = "changed"
-	if err := verifyChangeSafe(before, after, ownershipPolicy{toolName: "mytool", predicate: DefaultOwnershipPredicate("mytool"), markerEnabled: true}, true); err == nil {
+	if err := verifyChangeSafe(before, after, ownershipPolicy{toolName: "mytool", predicate: DefaultOwnershipPredicate("mytool"), markerStyle: MarkerStyleCommandSuffix}, true); err == nil {
 		t.Fatal("gate accepted a top-level mutation")
 	}
 	after, _ = cloneSettings(before)
 	hooks := after["hooks"].(map[string]any)
 	groups := hooks["Stop"].([]any)
 	groups[0].(map[string]any)["matcher"] = "changed"
-	if err := verifyChangeSafe(before, after, ownershipPolicy{toolName: "mytool", predicate: DefaultOwnershipPredicate("mytool"), markerEnabled: true}, true); err == nil {
+	if err := verifyChangeSafe(before, after, ownershipPolicy{toolName: "mytool", predicate: DefaultOwnershipPredicate("mytool"), markerStyle: MarkerStyleCommandSuffix}, true); err == nil {
 		t.Fatal("gate accepted a foreign wrapper mutation")
+	}
+}
+
+func TestCommandSuffixMarkerRoundTripAndQuotedHashes(t *testing.T) {
+	clean := `env DEBUG=1 '/opt/my tool' 'argument # stays quoted'`
+	got := BuildCommandSuffixMarker(clean, "tool/name", "entry:id with spaces")
+	if !strings.HasPrefix(got, clean+" #") {
+		t.Fatalf("suffix = %q", got)
+	}
+	without, toolName, id, marked := ParseCommandSuffixMarker(got)
+	if !marked || without != clean || toolName != "tool/name" || id != "entry:id with spaces" {
+		t.Fatalf("parsed suffix = clean %q, tool %q, id %q, marked %t", without, toolName, id, marked)
+	}
+	stripped, didStrip := StripCommandSuffixMarker(got)
+	if !didStrip || stripped != clean {
+		t.Fatalf("stripped suffix = %q, stripped=%t", stripped, didStrip)
+	}
+
+	marker := strings.TrimPrefix(BuildCommandSuffixMarker("mytool", "mytool", "quoted"), "mytool ")
+	for _, command := range []string{
+		"mytool '" + marker + "'",
+		`mytool "` + marker + `"`,
+		"mytool foo\\ " + marker,
+	} {
+		if _, _, _, marked := ParseCommandSuffixMarker(command); marked {
+			t.Errorf("quoted/escaped marker was detected in %q", command)
+		}
+	}
+	if _, _, _, marked := ParseCommandSuffixMarker("mytool " + marker + " trailing"); marked {
+		t.Fatal("non-trailing marker was detected")
+	}
+}
+
+func TestMarkerStylesAndAutoResolution(t *testing.T) {
+	tests := []struct {
+		name       string
+		style      MarkerStyle
+		wantStyle  MarkerStyle
+		wantSuffix bool
+	}{
+		{name: "explicit suffix", style: MarkerStyleCommandSuffix, wantStyle: MarkerStyleCommandSuffix, wantSuffix: true},
+		{name: "explicit none", style: MarkerStyleNone, wantStyle: MarkerStyleNone},
+		{name: "auto", style: MarkerStyleAuto, wantStyle: MarkerStyleCommandSuffix, wantSuffix: true},
+		{name: "zero auto", wantStyle: MarkerStyleCommandSuffix, wantSuffix: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "settings.json")
+			manager := ConfigManager{
+				Agent:        AgentClaude,
+				SettingsPath: path,
+				ToolName:     "mytool",
+				Invocation:   "/opt/mytool",
+				MarkerStyle:  tt.style,
+				Hooks:        []HookSpec{{Event: EventSessionStart, Command: "/opt/mytool start", ID: "start"}},
+			}
+			plan, err := manager.PlanInstall()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if plan.Style != tt.wantStyle {
+				t.Fatalf("resolved style = %q, want %q", plan.Style, tt.wantStyle)
+			}
+			if err := manager.Apply(context.Background(), plan, ApplyOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			entries := commandEntries(t, readConfig(t, path), "SessionStart")
+			if len(entries) != 1 {
+				t.Fatalf("entries = %#v", entries)
+			}
+			clean, owner, id, marked := ParseCommandSuffixMarker(entryCommand(entries[0]))
+			if marked != tt.wantSuffix {
+				t.Fatalf("suffix marked=%t, want %t: %#v", marked, tt.wantSuffix, entries[0])
+			}
+			if tt.wantSuffix && (clean != "/opt/mytool start" || owner != "mytool" || id != "start") {
+				t.Fatalf("suffix marker = clean %q, owner %q, id %q", clean, owner, id)
+			}
+			if !tt.wantSuffix && entryCommand(entries[0]) != "/opt/mytool start" {
+				t.Fatalf("none command = %q", entryCommand(entries[0]))
+			}
+			if entryHasLegacyMarker(entries[0]) {
+				t.Fatalf("new entry has legacy field marker: %#v", entries[0])
+			}
+		})
+	}
+
+	codexPath := filepath.Join(t.TempDir(), "hooks.json")
+	codex := ConfigManager{
+		Agent:        AgentCodex,
+		SettingsPath: codexPath,
+		ToolName:     "mytool",
+		Invocation:   "/opt/mytool",
+		Hooks:        []HookSpec{{Event: EventSessionStart, Command: "/opt/mytool start", ID: "start"}},
+	}
+	plan, err := codex.PlanInstall()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Style != MarkerStyleCommandSuffix {
+		t.Fatalf("Codex auto style = %q", plan.Style)
+	}
+
+	if style, err := resolveMarkerStyle(MarkerStyleAuto, AgentPi); err != nil || style != MarkerStyleNone {
+		t.Fatalf("pi auto style = %q, err=%v", style, err)
+	}
+	unsafe := ConfigManager{Agent: AgentPi, SettingsPath: filepath.Join(t.TempDir(), "settings.json"), ToolName: "mytool", Invocation: "mytool", MarkerStyle: MarkerStyleCommandSuffix}
+	if _, err := unsafe.PlanInstall(); err == nil || !strings.Contains(err.Error(), "unsafe") {
+		t.Fatalf("unsafe suffix plan error = %v", err)
+	}
+}
+
+func TestLegacyFieldMarkerConvergesToSuffix(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	writeConfig(t, path, map[string]any{
+		"hooks": map[string]any{"Stop": []any{map[string]any{"hooks": []any{
+			map[string]any{
+				"type": "command", "command": "/old/mytool stop --hand-edited", "async": false,
+				legacyMarkerOwnerField: "mytool", legacyMarkerIDField("mytool"): "stop",
+			},
+		}}}},
+	}, 0o644)
+	manager := ConfigManager{
+		Agent:        AgentClaude,
+		SettingsPath: path,
+		ToolName:     "mytool",
+		Invocation:   "/new/mytool",
+		MarkerStyle:  MarkerStyleCommandSuffix,
+		Hooks:        []HookSpec{{Event: EventStop, Command: "/new/mytool stop", ID: "stop"}},
+	}
+	plan, err := manager.PlanInstall()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.HasChanges || plan.Summary.Modified != 1 {
+		t.Fatalf("legacy-to-suffix plan = %+v", plan)
+	}
+	if err := manager.Apply(context.Background(), plan, ApplyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	entries := commandEntries(t, readConfig(t, path), "Stop")
+	if len(entries) != 1 {
+		t.Fatalf("legacy-to-suffix entries = %#v", entries)
+	}
+	clean, owner, id, marked := ParseCommandSuffixMarker(entryCommand(entries[0]))
+	if !marked || clean != "/new/mytool stop --hand-edited" || owner != "mytool" || id != "stop" || entryHasLegacyMarker(entries[0]) {
+		t.Fatalf("legacy marker was not replaced by suffix: %#v", entries[0])
+	}
+}
+
+func TestSuffixOwnershipConvergesAcrossStylesAndInvocationPaths(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	manager := ConfigManager{
+		Agent:        AgentClaude,
+		SettingsPath: path,
+		ToolName:     "mytool",
+		Invocation:   "/old/mytool",
+		MarkerStyle:  MarkerStyleCommandSuffix,
+		Hooks:        []HookSpec{{Event: EventStop, Command: "/old/mytool stop", ID: "stop"}},
+	}
+	plan, err := manager.PlanInstall()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Apply(context.Background(), plan, ApplyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	manager.Invocation = "/new/mytool"
+	manager.Hooks = []HookSpec{{Event: EventStop, Command: "/new/mytool stop", ID: "stop"}}
+	plan, err = manager.PlanInstall()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.HasChanges || plan.Summary.Modified != 1 || len(plan.Added) != 1 || len(plan.Removed) != 1 {
+		t.Fatalf("path convergence plan = %+v", plan)
+	}
+	if !strings.Contains(plan.Diff, BuildCommandSuffixMarker("/new/mytool stop", "mytool", "stop")) {
+		t.Fatalf("path convergence diff lacks suffix: %s", plan.Diff)
+	}
+	if err := manager.Apply(context.Background(), plan, ApplyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	entries := commandEntries(t, readConfig(t, path), "Stop")
+	if len(entries) != 1 || entryCommand(entries[0]) != BuildCommandSuffixMarker("/new/mytool stop", "mytool", "stop") {
+		t.Fatalf("path convergence entries = %#v", entries)
+	}
+
+	manager.MarkerStyle = MarkerStyleNone
+	plan, err = manager.PlanInstall()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.HasChanges || plan.Summary.Modified != 1 {
+		t.Fatalf("suffix-to-none plan = %+v", plan)
+	}
+	if err := manager.Apply(context.Background(), plan, ApplyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	entries = commandEntries(t, readConfig(t, path), "Stop")
+	if len(entries) != 1 || entryCommand(entries[0]) != "/new/mytool stop" {
+		t.Fatalf("suffix-to-none entries = %#v", entries)
+	}
+
+	// None intentionally leaves no durable marker. Switching back to a
+	// marker-authoritative style therefore requires the same explicit adoption
+	// opt-in as any other legacy predicate match.
+	manager.MarkerStyle = MarkerStyleCommandSuffix
+	manager.AdoptUnmarked = true
+	plan, err = manager.PlanInstall()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.HasChanges || plan.Summary.Modified != 1 {
+		t.Fatalf("none-to-suffix plan = %+v", plan)
+	}
+}
+
+func TestVerifyGateAcceptsSuffixOwnershipAndProtectsForeignCommands(t *testing.T) {
+	policy := ownershipPolicy{
+		toolName:    "mytool",
+		predicate:   DefaultOwnershipPredicate("mytool"),
+		markerStyle: MarkerStyleCommandSuffix,
+	}
+	owned := map[string]any{"type": "command", "command": BuildCommandSuffixMarker("/old/mytool stop", "mytool", "old")}
+	foreign := map[string]any{"type": "command", "command": BuildCommandSuffixMarker("/foreign/tool stop", "other-tool", "foreign")}
+	before := map[string]any{"hooks": map[string]any{"Stop": []any{map[string]any{"hooks": []any{owned, foreign}}}}}
+	after, err := cloneSettings(before)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner := after["hooks"].(map[string]any)["Stop"].([]any)[0].(map[string]any)["hooks"].([]any)
+	inner[0] = map[string]any{"type": "command", "command": BuildCommandSuffixMarker("/new/mytool stop", "mytool", "new")}
+	after["hooks"].(map[string]any)["Stop"].([]any)[0].(map[string]any)["hooks"] = inner
+	if err := verifyChangeSafe(before, after, policy, true); err != nil {
+		t.Fatalf("suffix-owned change rejected: %v", err)
+	}
+
+	bad, err := cloneSettings(before)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badInner := bad["hooks"].(map[string]any)["Stop"].([]any)[0].(map[string]any)["hooks"].([]any)
+	badInner[1].(map[string]any)["command"] = BuildCommandSuffixMarker("/changed/foreign stop", "other-tool", "foreign")
+	if err := verifyChangeSafe(before, bad, policy, true); err == nil {
+		t.Fatal("foreign command mutation passed suffix verify gate")
+	}
+}
+
+func TestClaudeSuffixSurvivesUnknownKeyStripping(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	manager := ConfigManager{
+		Agent:        AgentClaude,
+		SettingsPath: path,
+		ToolName:     "mytool",
+		Invocation:   "/opt/mytool",
+		MarkerStyle:  MarkerStyleCommandSuffix,
+		Hooks:        []HookSpec{{Event: EventSessionStart, Command: "/opt/mytool start", ID: "start"}},
+	}
+	plan, err := manager.PlanInstall()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Apply(context.Background(), plan, ApplyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	settings := readConfig(t, path)
+	for _, entry := range commandEntries(t, settings, "SessionStart") {
+		entry["vendorUnknown"] = true
+		entry[legacyMarkerOwnerField] = "mytool"
+		entry[legacyMarkerIDField("mytool")] = "start"
+	}
+	writeConfig(t, path, settings, 0o644)
+
+	// Simulate Claude's settings write: known hook fields survive, while
+	// unknown fields (including legacy JSON markers) disappear. The suffix is
+	// inside the known command field and must remain byte-for-byte intact.
+	for _, entry := range commandEntries(t, settings, "SessionStart") {
+		for key := range entry {
+			if key != "type" && key != "command" && key != "async" && key != "timeout" {
+				delete(entry, key)
+			}
+		}
+	}
+	writeConfig(t, path, settings, 0o644)
+	before := stringMustRead(t, path)
+	plan, err = manager.PlanInstall()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.HasChanges || plan.Summary.Added != 0 || plan.Summary.Removed != 0 || stringMustRead(t, path) != before {
+		t.Fatalf("suffix install was not a no-op after key stripping: %+v", plan)
 	}
 }
 

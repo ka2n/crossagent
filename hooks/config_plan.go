@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 
 	"github.com/ka2n/crossagent/agent"
 )
@@ -22,7 +23,9 @@ const (
 	Uninstall ChangeOperation = operationUninstall
 )
 
-// EntryChange describes one hook entry added or removed by a plan.
+// EntryChange describes one hook entry added or removed by a plan. Command is
+// the actual command spelling in the JSON diff, including a suffix when the
+// resolved marker style is CommandSuffix.
 type EntryChange struct {
 	Event   string
 	Command string
@@ -59,6 +62,9 @@ type ChangePlan struct {
 	FileExists bool
 	FileSize   int64
 	BackupPath string
+	// Style is the resolved ownership style used to build the plan. It is
+	// useful when MarkerStyle was left at its auto default.
+	Style      MarkerStyle
 	HasChanges bool
 	Added      []EntryChange
 	Removed    []EntryChange
@@ -73,6 +79,7 @@ type ChangePlan struct {
 	agent       agent.Name
 	toolName    string
 	invocation  string
+	markerStyle MarkerStyle
 	before      map[string]any
 	beforeExist bool
 	after       map[string]any
@@ -97,16 +104,18 @@ func (m ConfigManager) plan(operation ChangeOperation) (ChangePlan, error) {
 		return ChangePlan{}, err
 	}
 	plan := ChangePlan{
-		Path:       path,
-		Agent:      c.agent,
-		Operation:  operation,
-		BackupPath: backupPath(path, c.toolName),
-		path:       path,
-		operation:  operation,
-		agent:      c.agent,
-		toolName:   c.toolName,
-		invocation: c.invocation,
-		before:     before,
+		Path:        path,
+		Agent:       c.agent,
+		Operation:   operation,
+		BackupPath:  backupPath(path, c.toolName),
+		Style:       c.markerStyle,
+		path:        path,
+		operation:   operation,
+		agent:       c.agent,
+		toolName:    c.toolName,
+		invocation:  c.invocation,
+		markerStyle: c.markerStyle,
+		before:      before,
 	}
 	if info, statErr := os.Stat(path); statErr == nil {
 		plan.FileExists = true
@@ -165,7 +174,7 @@ func (m ConfigManager) plan(operation ChangeOperation) (ChangePlan, error) {
 	afterHooks, _ := hooksObject(after)
 	plan.Added = entryChanges(diffEntriesWithTool(beforeHooks, afterHooks, c.toolName))
 	plan.Removed = entryChanges(diffEntriesWithTool(afterHooks, beforeHooks, c.toolName))
-	plan.Summary = summarizeChange(before, after, order)
+	plan.Summary = summarizeChange(before, after, order, c.toolName)
 	beforeLines, err := settingsLines(before)
 	if err != nil {
 		return plan, err
@@ -239,11 +248,24 @@ func entryChanges(deltas []entryDelta) []EntryChange {
 	return out
 }
 
-func summarizeChange(before, after map[string]any, eventOrder []string) ChangeSummary {
+func sameEntryChange(left, right entryDelta) bool {
+	if left.ID != "" && left.ID == right.ID {
+		return true
+	}
+	leftCommand, _ := StripCommandSuffixMarker(left.Command)
+	rightCommand, _ := StripCommandSuffixMarker(right.Command)
+	if strings.TrimSpace(leftCommand) != "" && leftCommand == rightCommand {
+		return true
+	}
+	leftAction := actionKey(left.Command)
+	return leftAction != "" && leftAction == actionKey(right.Command)
+}
+
+func summarizeChange(before, after map[string]any, eventOrder []string, toolName string) ChangeSummary {
 	beforeHooks, _ := hooksObject(before)
 	afterHooks, _ := hooksObject(after)
-	added := diffEntries(beforeHooks, afterHooks)
-	removed := diffEntries(afterHooks, beforeHooks)
+	added := diffEntriesWithTool(beforeHooks, afterHooks, toolName)
+	removed := diffEntriesWithTool(afterHooks, beforeHooks, toolName)
 
 	perEvent := map[string]*EventChange{}
 	get := func(event string) *EventChange {
@@ -280,7 +302,7 @@ func summarizeChange(before, after map[string]any, eventOrder []string) ChangeSu
 			if pairedAdd[index] || addedDelta.Event != removedDelta.Event {
 				continue
 			}
-			if actionKey(addedDelta.Command) != actionKey(removedDelta.Command) || actionKey(addedDelta.Command) == "" {
+			if !sameEntryChange(addedDelta, removedDelta) {
 				continue
 			}
 			pairedAdd[index] = true

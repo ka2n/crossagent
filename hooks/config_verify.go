@@ -252,11 +252,11 @@ func addedEntryOwned(raw any, event, command string, policy ownershipPolicy) boo
 	if !ok {
 		return false
 	}
-	if !policy.markerEnabled {
-		return predicateOwnsEntry(event, entry, command, policy)
+	if policy.markerStyle == MarkerStyleCommandSuffix {
+		_, marked, _ := markerFor(entry, policy.toolName)
+		return marked
 	}
-	_, marked, _ := markerFor(entry, policy.toolName)
-	return marked
+	return predicateOwnsEntry(event, entry, command, policy)
 }
 
 func deltaOwnership(raw any, event string, policy ownershipPolicy) (owned, unmarked bool) {
