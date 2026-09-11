@@ -136,19 +136,35 @@ consumers that need structured fields.
 ```go
 import (
     "context"
+    "errors"
+    "io"
 
     "github.com/ka2n/crossagent/agent"
     "github.com/ka2n/crossagent/transcript"
 )
 
-status, err := transcript.Stream(context.Background(), agent.Codex, path, cursor, state,
-    func(record transcript.Record) error {
-        return index(record.Timestamp, record.Role, record.Kind, record.Content)
-    })
+reader, err := transcript.Open(context.Background(), agent.Codex, path, cursor, state)
 if err != nil {
     return err
 }
-cursor, state = status.Cursor, status.State
+defer reader.Close()
+
+for {
+    record, err := reader.Next()
+    if errors.Is(err, io.EOF) {
+        break
+    }
+    if err != nil {
+        return err
+    }
+    if err := index(record); err != nil {
+        return err
+    }
+    if err := reader.Ack(); err != nil {
+        return err
+    }
+}
+cursor, state = reader.Cursor(), reader.State()
 ```
 
 `Cursor.Offset` advances only past newline-terminated records. If an agent is
@@ -164,11 +180,13 @@ may contain visible text and several tool calls. `Record.Data` is reconstructed
 from the visible message or tool block; thinking text, signatures and unrelated
 vendor metadata are not included.
 
-`Stream` calls its callback synchronously, so callback speed provides
-backpressure without accumulating transcript records. Its cursor advances only
-after the callback accepts a record. `Cursor.RecordIndex` resumes inside a pi or
-Claude line that produced several records without redelivering earlier records.
-`Read` is a bounded convenience wrapper for callers that want a slice.
+`Reader.Next` pulls one record at a time without accumulating the transcript.
+After the consumer accepts a record it calls `Ack`; until then `Cursor` and
+`State` remain at the previous checkpoint, and another `Next` returns
+`ErrUnackedRecord`. `Cursor.RecordIndex` resumes inside a pi or Claude line that
+produced several records without redelivering acknowledged records. `NewReader`
+accepts an `io.ReadSeeker` without taking ownership for tests and embedded uses.
+`Stream` and `Read` remain bounded convenience wrappers.
 
 ## Hook facts
 

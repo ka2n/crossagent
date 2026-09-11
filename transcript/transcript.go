@@ -119,8 +119,8 @@ type LineError struct {
 func (e *LineError) Error() string { return e.Err.Error() }
 func (e *LineError) Unwrap() error { return e.Err }
 
-// StreamStatus describes where a streaming pass stopped.
-type StreamStatus struct {
+// Status describes where a transcript read stopped.
+type Status struct {
 	Cursor       Cursor
 	State        State
 	Partial      bool
@@ -128,6 +128,9 @@ type StreamStatus struct {
 	LimitReached bool
 	Records      int
 }
+
+// StreamStatus is a descriptive alias for Stream callers.
+type StreamStatus = Status
 
 // Stream synchronously delivers records with natural callback backpressure.
 // Its cursor advances after each successful callback; RecordIndex permits an
@@ -177,9 +180,9 @@ func Stream(ctx context.Context, name agent.Name, path string, cursor Cursor, st
 		if err := ctx.Err(); err != nil {
 			return status, err
 		}
-		line, consumed, readErr := readLine(r)
+		line, consumed, hasData, readErr := readLine(r)
 		if errors.Is(readErr, io.EOF) {
-			status.Partial = len(line) > 0
+			status.Partial = hasData
 			return status, nil
 		}
 		if errors.Is(readErr, ErrLineTooLong) {
@@ -236,7 +239,7 @@ func Read(ctx context.Context, name agent.Name, path string, cursor Cursor, stat
 	return batch, err
 }
 
-func readLine(r *bufio.Reader) ([]byte, int64, error) {
+func readLine(r *bufio.Reader) ([]byte, int64, bool, error) {
 	var line []byte
 	var consumed int64
 	tooLong := false
@@ -252,9 +255,9 @@ func readLine(r *bufio.Reader) ([]byte, int64, error) {
 			continue
 		}
 		if tooLong && err == nil {
-			return nil, consumed, ErrLineTooLong
+			return nil, consumed, true, ErrLineTooLong
 		}
-		return line, consumed, err
+		return line, consumed, consumed > 0, err
 	}
 }
 
@@ -262,12 +265,16 @@ func headerFingerprint(f *os.File) (string, error) {
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return "", err
 	}
-	line, _, err := readLine(bufio.NewReaderSize(f, 64*1024))
+	line, _, _, err := readLine(bufio.NewReaderSize(f, 64*1024))
 	if err != nil && !errors.Is(err, io.EOF) {
 		return "", err
 	}
+	return fingerprintLine(line), nil
+}
+
+func fingerprintLine(line []byte) string {
 	sum := sha256.Sum256(bytes.TrimSpace(line))
-	return fmt.Sprintf("%x", sum), nil
+	return fmt.Sprintf("%x", sum)
 }
 
 func parseTime(raw json.RawMessage) time.Time {
