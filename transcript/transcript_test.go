@@ -105,7 +105,7 @@ func TestParseLineRejectsMalformedAndUnsupportedInput(t *testing.T) {
 	if _, err := ParseLine(agent.Codex, []byte(`{"type":`), &state); err == nil {
 		t.Fatal("malformed JSON accepted")
 	}
-	if _, err := ParseLine(agent.Claude, []byte(`{"type":"user"}`), &state); err == nil {
+	if _, err := ParseLine(agent.Name("gemini"), []byte(`{"type":"user"}`), &state); err == nil {
 		t.Fatal("unsupported agent accepted")
 	}
 	if _, err := ParseLine(agent.Pi, make([]byte, MaxLineBytes+1), &state); err != ErrLineTooLong {
@@ -192,6 +192,35 @@ func TestReadPaginatesRecordsWithoutDuplicates(t *testing.T) {
 	}
 	if first.Records[MaxBatchRecords-1].NativeID != "m999" || second.Records[0].NativeID != "m1000" {
 		t.Fatalf("page boundary = %q/%q", first.Records[MaxBatchRecords-1].NativeID, second.Records[0].NativeID)
+	}
+}
+
+func TestStreamResumesInsideMultiRecordLineAfterCallbackError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	body := `{"type":"session","id":"pi-stream","cwd":"/tmp"}` + "\n" +
+		`{"type":"message","id":"message-1","message":{"role":"assistant","content":[{"type":"text","text":"hello"},{"type":"toolCall","id":"tool-1","name":"read","arguments":{"path":"a"}},{"type":"toolCall","id":"tool-2","name":"read","arguments":{"path":"b"}}]}}` + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stop := errors.New("backpressure stop")
+	var first []string
+	status, err := Stream(context.Background(), agent.Pi, path, Cursor{}, State{}, func(record Record) error {
+		if len(first) == 1 {
+			return stop
+		}
+		first = append(first, record.NativeID)
+		return nil
+	})
+	if !errors.Is(err, stop) || status.Cursor.RecordIndex != 1 || status.Records != 1 {
+		t.Fatalf("first status=%#v err=%v", status, err)
+	}
+	var resumed []string
+	final, err := Stream(context.Background(), agent.Pi, path, status.Cursor, status.State, func(record Record) error {
+		resumed = append(resumed, record.NativeID)
+		return nil
+	})
+	if err != nil || len(resumed) != 2 || resumed[0] != "tool-1" || resumed[1] != "tool-2" || final.Cursor.RecordIndex != 0 {
+		t.Fatalf("resumed=%#v final=%#v err=%v", resumed, final, err)
 	}
 }
 

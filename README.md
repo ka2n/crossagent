@@ -10,7 +10,7 @@ It covers four fact-oriented capabilities:
    filesystem discovery.
 3. **Normalize and manage** hook events, payload fields, output channels,
    async semantics, and safe declarative configuration changes.
-4. **Read and normalize** append-only Codex and pi transcript JSONL.
+4. **Read and normalize** append-only Claude Code, Codex, and pi transcript JSONL.
 
 The path and hook packages provide the facts needed for session-location
 discovery and safe hook configuration management. Hook configuration changes
@@ -127,8 +127,8 @@ start time is known.
 
 ## Transcript records
 
-`crossagent/transcript` turns Codex rollout and pi session JSONL into a small
-common record. Headers update a caller-owned `State`; conversation and tool
+`crossagent/transcript` turns Claude Code, Codex, and pi session JSONL into a
+small common record. Headers update a caller-owned `State`; conversation and tool
 events produce records; reasoning, token usage, and other internal events are
 ignored. `Record.Data` contains a sanitized visible message or tool event for
 consumers that need structured fields.
@@ -141,14 +141,14 @@ import (
     "github.com/ka2n/crossagent/transcript"
 )
 
-batch, err := transcript.Read(context.Background(), agent.Codex, path, cursor, state)
+status, err := transcript.Stream(context.Background(), agent.Codex, path, cursor, state,
+    func(record transcript.Record) error {
+        return index(record.Timestamp, record.Role, record.Kind, record.Content)
+    })
 if err != nil {
     return err
 }
-cursor, state = batch.Cursor, batch.State
-for _, record := range batch.Records {
-    index(record.Timestamp, record.Role, record.Kind, record.Content)
-}
+cursor, state = status.Cursor, status.State
 ```
 
 `Cursor.Offset` advances only past newline-terminated records. If an agent is
@@ -163,6 +163,12 @@ and byte cursors. It returns zero or more records because a pi assistant message
 may contain visible text and several tool calls. `Record.Data` is reconstructed
 from the visible message or tool block; thinking text, signatures and unrelated
 vendor metadata are not included.
+
+`Stream` calls its callback synchronously, so callback speed provides
+backpressure without accumulating transcript records. Its cursor advances only
+after the callback accepts a record. `Cursor.RecordIndex` resumes inside a pi or
+Claude line that produced several records without redelivering earlier records.
+`Read` is a bounded convenience wrapper for callers that want a slice.
 
 ## Hook facts
 

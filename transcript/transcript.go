@@ -33,11 +33,13 @@ type Record struct {
 	SessionID string          `json:"session_id"`
 	Cwd       string          `json:"cwd"`
 	Offset    int64           `json:"offset"`
+	Index     int             `json:"index"`
 	Timestamp time.Time       `json:"timestamp"`
 	Role      string          `json:"role"`
 	Kind      string          `json:"kind"`
 	Content   string          `json:"content"`
 	NativeID  string          `json:"native_id,omitempty"`
+	Metadata  map[string]any  `json:"metadata,omitempty"`
 	Data      json.RawMessage `json:"data,omitempty"`
 }
 
@@ -60,6 +62,8 @@ func ParseLine(name agent.Name, line []byte, state *State) ([]Record, error) {
 	}
 	var records []Record
 	switch name {
+	case agent.Claude:
+		records = parseClaude(raw, state)
 	case agent.Codex:
 		records = parseCodex(raw, state)
 	case agent.Pi:
@@ -69,6 +73,7 @@ func ParseLine(name agent.Name, line []byte, state *State) ([]Record, error) {
 	}
 	for i := range records {
 		records[i].Agent, records[i].SessionID, records[i].Cwd = name, state.SessionID, state.Cwd
+		records[i].Index = i
 	}
 	return records, nil
 }
@@ -76,24 +81,24 @@ func ParseLine(name agent.Name, line []byte, state *State) ([]Record, error) {
 const (
 	// MaxLineBytes bounds one vendor JSON object.
 	MaxLineBytes = 16 << 20
-	// MaxBatchRecords bounds records returned by one Read call.
+	// MaxBatchRecords bounds records delivered by one Stream or Read call.
 	MaxBatchRecords = 1000
 	// MaxBatchBytes bounds complete source bytes consumed by one Read call.
 	MaxBatchBytes = 64 << 20
 )
 
 var ErrLineTooLong = errors.New("transcript: JSONL line exceeds 16 MiB")
-var ErrBatchTooManyRecords = errors.New("transcript: one JSONL line exceeds batch record limit")
 
 // Batch is the result of reading complete JSONL records from an offset.
 type Batch struct {
 	Records []Record
 	Cursor  Cursor
 	// NextOffset mirrors Cursor.Offset for callers that only display progress.
-	NextOffset int64
-	Partial    bool
-	Truncated  bool
-	State      State
+	NextOffset   int64
+	Partial      bool
+	Truncated    bool
+	LimitReached bool
+	State        State
 }
 
 // Cursor identifies both a byte position and the transcript generation whose
@@ -101,6 +106,7 @@ type Batch struct {
 type Cursor struct {
 	Offset      int64
 	Fingerprint string
+	RecordIndex int
 }
 
 // LineError reports a complete bad line that callers may quarantine. Retrying
@@ -113,78 +119,121 @@ type LineError struct {
 func (e *LineError) Error() string { return e.Err.Error() }
 func (e *LineError) Unwrap() error { return e.Err }
 
-// Read reads complete lines beginning at offset. An unterminated final line is
-// left unconsumed and reported through Partial, so a later call can retry it.
-func Read(ctx context.Context, name agent.Name, path string, cursor Cursor, state State) (Batch, error) {
+// StreamStatus describes where a streaming pass stopped.
+type StreamStatus struct {
+	Cursor       Cursor
+	State        State
+	Partial      bool
+	Truncated    bool
+	LimitReached bool
+	Records      int
+}
+
+// Stream synchronously delivers records with natural callback backpressure.
+// Its cursor advances after each successful callback; RecordIndex permits an
+// interrupted multi-record line to resume without redelivering accepted data.
+func Stream(ctx context.Context, name agent.Name, path string, cursor Cursor, state State, yield func(Record) error) (StreamStatus, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if yield == nil {
+		return StreamStatus{}, errors.New("transcript: nil stream callback")
+	}
 	if cursor.Offset < 0 {
-		return Batch{}, errors.New("transcript: negative offset")
+		return StreamStatus{}, errors.New("transcript: negative offset")
+	}
+	if cursor.RecordIndex < 0 {
+		return StreamStatus{}, errors.New("transcript: negative record index")
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return Batch{}, err
+		return StreamStatus{}, err
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
-		return Batch{}, err
+		return StreamStatus{}, err
 	}
 	fingerprint, err := headerFingerprint(f)
 	if err != nil {
-		return Batch{}, err
+		return StreamStatus{}, err
 	}
 	truncated := cursor.Offset > info.Size() || cursor.Fingerprint != "" && cursor.Fingerprint != fingerprint
 	if truncated {
-		cursor.Offset, state = 0, State{}
+		cursor.Offset, cursor.RecordIndex, state = 0, 0, State{}
 	}
 	cursor.Fingerprint = fingerprint
 	if _, err := f.Seek(cursor.Offset, io.SeekStart); err != nil {
-		return Batch{}, err
+		return StreamStatus{}, err
 	}
 	startOffset := cursor.Offset
-	b := Batch{Cursor: cursor, NextOffset: cursor.Offset, State: state, Truncated: truncated}
+	status := StreamStatus{Cursor: cursor, State: state, Truncated: truncated}
 	r := bufio.NewReaderSize(f, 64*1024)
 	for {
-		if len(b.Records) >= MaxBatchRecords || b.NextOffset-startOffset >= MaxBatchBytes {
-			return b, nil
+		if status.Records >= MaxBatchRecords || status.Cursor.Offset-startOffset >= MaxBatchBytes {
+			status.LimitReached = true
+			return status, nil
 		}
 		if err := ctx.Err(); err != nil {
-			return b, err
+			return status, err
 		}
 		line, consumed, readErr := readLine(r)
 		if errors.Is(readErr, io.EOF) {
-			b.Partial = len(line) > 0
-			return b, nil
+			status.Partial = len(line) > 0
+			return status, nil
 		}
 		if errors.Is(readErr, ErrLineTooLong) {
-			next := Cursor{Offset: b.NextOffset + consumed, Fingerprint: fingerprint}
-			return b, &LineError{Next: next, Err: readErr}
+			next := Cursor{Offset: status.Cursor.Offset + consumed, Fingerprint: fingerprint}
+			return status, &LineError{Next: next, Err: readErr}
 		}
 		if readErr != nil {
-			return b, readErr
+			return status, readErr
 		}
-		if b.NextOffset-startOffset+int64(len(line)) > MaxBatchBytes {
-			return b, nil
+		if status.Cursor.Offset-startOffset+int64(len(line)) > MaxBatchBytes {
+			status.LimitReached = true
+			return status, nil
 		}
-		previousState := b.State
-		records, err := ParseLine(name, line, &b.State)
+		records, err := ParseLine(name, line, &status.State)
 		if err != nil {
-			next := Cursor{Offset: b.NextOffset + int64(len(line)), Fingerprint: fingerprint}
-			return b, &LineError{Next: next, Err: err}
+			next := Cursor{Offset: status.Cursor.Offset + int64(len(line)), Fingerprint: fingerprint}
+			return status, &LineError{Next: next, Err: err}
 		}
-		if len(b.Records)+len(records) > MaxBatchRecords {
-			b.State = previousState
-			return b, ErrBatchTooManyRecords
+		if status.Cursor.RecordIndex > len(records) {
+			return status, errors.New("transcript: cursor record index exceeds line records")
 		}
 		for i := range records {
-			records[i].Offset = b.NextOffset
+			records[i].Offset = status.Cursor.Offset
 		}
-		b.NextOffset += int64(len(line))
-		b.Cursor.Offset = b.NextOffset
-		b.Records = append(b.Records, records...)
+		for i := status.Cursor.RecordIndex; i < len(records); i++ {
+			if status.Records >= MaxBatchRecords {
+				status.LimitReached = true
+				return status, nil
+			}
+			if err := yield(records[i]); err != nil {
+				return status, err
+			}
+			status.Records++
+			status.Cursor.RecordIndex = i + 1
+		}
+		status.Cursor.Offset += int64(len(line))
+		status.Cursor.RecordIndex = 0
 	}
+}
+
+// Read is a bounded convenience wrapper around Stream.
+func Read(ctx context.Context, name agent.Name, path string, cursor Cursor, state State) (Batch, error) {
+	batch := Batch{}
+	status, err := Stream(ctx, name, path, cursor, state, func(record Record) error {
+		batch.Records = append(batch.Records, record)
+		return nil
+	})
+	batch.Cursor = status.Cursor
+	batch.NextOffset = status.Cursor.Offset
+	batch.Partial = status.Partial
+	batch.Truncated = status.Truncated
+	batch.LimitReached = status.LimitReached
+	batch.State = status.State
+	return batch, err
 }
 
 func readLine(r *bufio.Reader) ([]byte, int64, error) {
@@ -267,11 +316,18 @@ func concise(value string) string {
 	value = strings.TrimSpace(value)
 	const limit = 4096
 	if len(value) > limit {
-		value = value[:limit]
-		for !utf8.ValidString(value) {
-			value = value[:len(value)-1]
-		}
-		return value + "…"
+		return conciseBytes(value, limit) + "…"
+	}
+	return value
+}
+
+func conciseBytes(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	value = value[:limit]
+	for !utf8.ValidString(value) {
+		value = value[:len(value)-1]
 	}
 	return value
 }
