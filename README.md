@@ -3,13 +3,14 @@
 `crossagent` is a small, dependency-free Go library for tooling that spans
 Claude Code, Codex, and pi.
 
-It covers three fact-oriented capabilities:
+It covers four fact-oriented capabilities:
 
 1. **Detect** installed agents and their versions.
 2. **Resolve** session, transcript, and configuration locations without
    filesystem discovery.
 3. **Normalize and manage** hook events, payload fields, output channels,
    async semantics, and safe declarative configuration changes.
+4. **Read and normalize** append-only Codex and pi transcript JSONL.
 
 The path and hook packages provide the facts needed for session-location
 discovery and safe hook configuration management. Hook configuration changes
@@ -123,6 +124,45 @@ It honors `CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
 encoders are one-way because their on-disk keys are lossy. Codex transcript
 paths include a timestamp, so the resolver returns a search pattern unless the
 start time is known.
+
+## Transcript records
+
+`crossagent/transcript` turns Codex rollout and pi session JSONL into a small
+common record. Headers update a caller-owned `State`; conversation and tool
+events produce records; reasoning, token usage, and other internal events are
+ignored. `Record.Data` contains a sanitized visible message or tool event for
+consumers that need structured fields.
+
+```go
+import (
+    "context"
+
+    "github.com/ka2n/crossagent/agent"
+    "github.com/ka2n/crossagent/transcript"
+)
+
+batch, err := transcript.Read(context.Background(), agent.Codex, path, cursor, state)
+if err != nil {
+    return err
+}
+cursor, state = batch.Cursor, batch.State
+for _, record := range batch.Records {
+    index(record.Timestamp, record.Role, record.Kind, record.Content)
+}
+```
+
+`Cursor.Offset` advances only past newline-terminated records. If an agent is
+still writing the final JSON object, `Partial` is true and the same bytes are
+retried on the next read. If the saved offset is beyond the current file size
+or its header fingerprint changes, `Truncated` is true and reading restarts
+with empty state. Reads are bounded to
+16 MiB per line, 1,000 records and 64 MiB of source data per batch.
+
+`ParseLine` is also public for applications that already own file traversal
+and byte cursors. It returns zero or more records because a pi assistant message
+may contain visible text and several tool calls. `Record.Data` is reconstructed
+from the visible message or tool block; thinking text, signatures and unrelated
+vendor metadata are not included.
 
 ## Hook facts
 
