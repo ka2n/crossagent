@@ -2,19 +2,23 @@ package transcript
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 
 	"github.com/ka2n/crossagent/agent"
 )
 
-var ErrUnackedRecord = errors.New("transcript: acknowledge the current record before calling Next")
-var ErrNoPendingRecord = errors.New("transcript: no record to acknowledge")
+var ErrUnackedEntry = errors.New("transcript: acknowledge the current entry before calling Next")
+var ErrNoPendingEntry = errors.New("transcript: no entry to acknowledge")
+var ErrReaderUnusable = errors.New("transcript: reader is unusable after source read failure")
 
-// Reader pulls normalized records from one transcript while keeping an
-// acknowledged checkpoint separate from the record currently being handled.
+// Reader pulls one source-line Entry at a time while keeping its acknowledged
+// checkpoint separate from the entry currently being handled.
 type Reader struct {
 	ctx       context.Context
 	name      agent.Name
@@ -23,14 +27,11 @@ type Reader struct {
 	buffer    *bufio.Reader
 	cursor    Cursor
 	state     State
-	working   State
 	partial   bool
 	truncated bool
 	exhausted bool
+	unusable  error
 
-	records      []Record
-	recordIndex  int
-	lineBytes    int64
 	pending      bool
 	pendingNext  Cursor
 	pendingState State
@@ -59,7 +60,10 @@ func NewReader(ctx context.Context, name agent.Name, source io.ReadSeeker, curso
 	if source == nil {
 		return nil, errors.New("transcript: nil reader source")
 	}
-	if cursor.Offset < 0 || cursor.RecordIndex < 0 {
+	if name != agent.Claude && name != agent.Codex && name != agent.Pi {
+		return nil, fmt.Errorf("transcript: unsupported agent %q", name)
+	}
+	if cursor.Offset < 0 {
 		return nil, errors.New("transcript: negative cursor")
 	}
 	size, err := source.Seek(0, io.SeekEnd)
@@ -72,8 +76,12 @@ func NewReader(ctx context.Context, name agent.Name, source io.ReadSeeker, curso
 	}
 	truncated := cursor.Offset > size || cursor.Fingerprint != "" && cursor.Fingerprint != fingerprint
 	if truncated {
-		cursor.Offset, cursor.RecordIndex, state = 0, 0, State{}
+		cursor.Offset, state = 0, State{}
 	}
+	// RecordIndex belonged to the pre-lossless, multi-record-per-line API.
+	// A migrated cursor resumes at its source-line offset and may redeliver that
+	// line, which is safer than skipping source bytes.
+	cursor.RecordIndex = 0
 	cursor.Fingerprint = fingerprint
 	if _, err := source.Seek(cursor.Offset, io.SeekStart); err != nil {
 		return nil, err
@@ -81,82 +89,69 @@ func NewReader(ctx context.Context, name agent.Name, source io.ReadSeeker, curso
 	return &Reader{
 		ctx: ctx, name: name, source: source,
 		buffer: bufio.NewReaderSize(source, 64*1024),
-		cursor: cursor, state: state, working: state, truncated: truncated,
+		cursor: cursor, state: state, truncated: truncated,
 	}, nil
 }
 
-// Next returns the next record. The caller must call Ack after accepting it;
-// until then Cursor and State remain at the previous acknowledged checkpoint.
-func (r *Reader) Next() (Record, error) {
+// Next returns the next complete source-line entry. The caller must call Ack
+// after accepting it; until then Cursor and State remain at the previous
+// acknowledged checkpoint.
+func (r *Reader) Next() (Entry, error) {
 	if r.pending {
-		return Record{}, ErrUnackedRecord
+		return Entry{}, ErrUnackedEntry
+	}
+	if r.unusable != nil {
+		return Entry{}, errors.Join(ErrReaderUnusable, r.unusable)
 	}
 	if r.exhausted {
-		return Record{}, io.EOF
+		return Entry{}, io.EOF
 	}
-	for {
-		if err := r.ctx.Err(); err != nil {
-			return Record{}, err
-		}
-		if r.recordIndex < len(r.records) {
-			record := r.records[r.recordIndex]
-			next := r.cursor
-			next.RecordIndex = r.recordIndex + 1
-			if next.RecordIndex == len(r.records) {
-				next.Offset += r.lineBytes
-				next.RecordIndex = 0
-			}
-			r.pending, r.pendingNext, r.pendingState = true, next, r.working
-			return record, nil
-		}
+	if err := r.ctx.Err(); err != nil {
+		return Entry{}, err
+	}
 
-		line, consumed, hasData, readErr := readLine(r.buffer)
-		if errors.Is(readErr, io.EOF) {
-			r.partial = hasData
-			r.exhausted = true
-			return Record{}, io.EOF
-		}
-		if errors.Is(readErr, ErrLineTooLong) {
-			next := Cursor{Offset: r.cursor.Offset + consumed, Fingerprint: r.cursor.Fingerprint}
-			r.cursor = next
-			return Record{}, &LineError{Next: next, Err: readErr}
-		}
-		if readErr != nil {
-			return Record{}, readErr
-		}
-		r.working = r.state
-		records, err := ParseLine(r.name, line, &r.working)
-		if err != nil {
-			next := Cursor{Offset: r.cursor.Offset + int64(len(line)), Fingerprint: r.cursor.Fingerprint}
-			r.cursor = next
-			return Record{}, &LineError{Next: next, Err: err}
-		}
-		if r.cursor.RecordIndex > len(records) {
-			return Record{}, errors.New("transcript: cursor record index exceeds line records")
-		}
-		for index := range records {
-			records[index].Offset = r.cursor.Offset
-		}
-		r.records, r.recordIndex, r.lineBytes = records, r.cursor.RecordIndex, int64(len(line))
-		if len(records) == 0 {
-			r.cursor.Offset += r.lineBytes
-			r.cursor.RecordIndex = 0
-			r.state = r.working
-			r.records = nil
-		}
+	line, consumed, hasData, readErr := readLine(r.ctx, r.buffer)
+	if errors.Is(readErr, io.EOF) {
+		r.partial = hasData
+		r.exhausted = true
+		return Entry{}, io.EOF
 	}
+	if errors.Is(readErr, ErrLineTooLong) {
+		next := Cursor{Offset: r.cursor.Offset + consumed, Fingerprint: r.cursor.Fingerprint}
+		lineErr := &LineError{Offset: r.cursor.Offset, Length: consumed, Next: next, Err: readErr}
+		r.cursor = next
+		return Entry{}, lineErr
+	}
+	if readErr != nil {
+		if _, seekErr := r.source.Seek(r.cursor.Offset, io.SeekStart); seekErr != nil {
+			r.unusable = errors.Join(readErr, fmt.Errorf("restore acknowledged offset: %w", seekErr))
+			return Entry{}, errors.Join(ErrReaderUnusable, r.unusable)
+		}
+		r.buffer.Reset(r.source)
+		return Entry{}, readErr
+	}
+
+	working := r.state
+	entry, err := ParseLine(r.name, line, &working)
+	if err != nil {
+		next := Cursor{Offset: r.cursor.Offset + consumed, Fingerprint: r.cursor.Fingerprint}
+		lineErr := &LineError{Offset: r.cursor.Offset, Length: consumed, Raw: append([]byte(nil), line...), Next: next, Err: err}
+		r.cursor = next
+		return Entry{}, lineErr
+	}
+	entry.Offset = r.cursor.Offset
+	r.pending = true
+	r.pendingNext = Cursor{Offset: r.cursor.Offset + consumed, Fingerprint: r.cursor.Fingerprint}
+	r.pendingState = working
+	return entry, nil
 }
 
-// Ack marks the last record returned by Next as accepted.
+// Ack marks the last entry returned by Next as accepted.
 func (r *Reader) Ack() error {
 	if !r.pending {
-		return ErrNoPendingRecord
+		return ErrNoPendingEntry
 	}
 	r.cursor, r.state = r.pendingNext, r.pendingState
-	r.recordIndex++
-	if r.cursor.RecordIndex == 0 {
-		r.records, r.recordIndex, r.lineBytes = nil, 0, 0
-	}
 	r.pending = false
 	return nil
 }
@@ -179,13 +174,50 @@ func (r *Reader) Close() error {
 	return nil
 }
 
+func readLine(ctx context.Context, r *bufio.Reader) ([]byte, int64, bool, error) {
+	var line []byte
+	var consumed int64
+	tooLong := false
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, consumed, consumed > 0, err
+		}
+		part, err := r.ReadSlice('\n')
+		consumed += int64(len(part))
+		if !tooLong && len(line)+len(part) > MaxLineBytes {
+			line, tooLong = nil, true
+		} else if !tooLong {
+			line = append(line, part...)
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		if tooLong && err == nil {
+			return nil, consumed, true, ErrLineTooLong
+		}
+		return line, consumed, consumed > 0, err
+	}
+}
+
 func seekerFingerprint(source io.ReadSeeker) (string, error) {
 	if _, err := source.Seek(0, io.SeekStart); err != nil {
 		return "", err
 	}
-	line, _, _, err := readLine(bufio.NewReaderSize(source, 64*1024))
-	if err != nil && !errors.Is(err, io.EOF) {
+	line, _, _, err := readLine(context.Background(), bufio.NewReaderSize(source, 64*1024))
+	if errors.Is(err, io.EOF) {
+		// Without a complete first line there is no stable transcript
+		// identity yet.
+		return "", nil
+	}
+	if err != nil {
 		return "", err
 	}
-	return fingerprintLine(line), nil
+	return legacyFingerprintLine(line), nil
+}
+
+// legacyFingerprintLine is the exact fdfc880 cursor algorithm. Keep it stable:
+// persisted consumers use this value to detect transcript replacement.
+func legacyFingerprintLine(line []byte) string {
+	sum := sha256.Sum256(bytes.TrimSpace(line))
+	return fmt.Sprintf("%x", sum)
 }

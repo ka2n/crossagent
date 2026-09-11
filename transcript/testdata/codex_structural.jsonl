@@ -1,0 +1,13 @@
+{"timestamp":"2026-09-10T01:00:00Z","type":"session_meta","payload":{"id":"codex-fixture","cwd":"/work/codex","model_provider":"openai","cli_version":"fixture"}}
+{"timestamp":"2026-09-10T01:00:01Z","type":"turn_context","payload":{"cwd":"/work/turn","model":"gpt-fixture","model_provider":"openai"}}
+{"timestamp":"2026-09-10T01:00:02Z","type":"event_msg","payload":{ "type":"agent_reasoning", "text":"reasoning update", "native_counter":1}}
+{"timestamp":"2026-09-10T01:00:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"exec-1","command":"go test ./...","aggregated_output":"ok\n","exit_code":0}}
+{"timestamp":"2026-09-10T01:00:04Z","type":"response_item","payload":{ "type":"agent_reasoning", "text":"response reasoning", "encrypted_content":"opaque"}}
+{"timestamp":"2026-09-10T01:00:05Z","type":"response_item","payload":{ "type":"local_shell_call", "id":"shell-item", "call_id":"shell-1", "status":"completed", "action": {"type":"exec","command":["go","test","./..."],"working_directory":"/work/turn"}, "native_shell":true}}
+{"timestamp":"2026-09-10T01:00:06Z","type":"response_item","payload":{"type":"custom_tool_call","id":"custom-item","call_id":"custom-1","name":"apply_patch","status":"completed","input":"*** Begin Patch"}}
+{"timestamp":"2026-09-10T01:00:07Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"custom-1","output":[ {"type":"output_text","text":"Done!"} ]}}
+{"timestamp":"2026-09-10T01:00:08Z","type":"response_item","payload":{"type":"tool_search_call","call_id":"search-1","status":"completed","execution":"server","arguments": {"query":"deploy tool","limit":5}}}
+{"timestamp":"2026-09-10T01:00:09Z","type":"response_item","payload":{"type":"tool_search_output","call_id":"search-1","status":"completed","execution":"server","tools":[ {"type":"namespace","name":"deploy","description":"fixture"} ]}}
+{"timestamp":"2026-09-10T01:00:10Z","type":"response_item","payload":{"type":"web_search_call","id":"web-1","status":"completed","action": {"type":"search","query":"fixture query","queries":["fixture query"]}}}
+{"timestamp":"2026-09-10T01:00:11Z","type":"response_item","payload":{"type":"image_generation_call","id":"image-1","status":"completed","result":"iVBORw0KGgo=","revised_prompt":"fixture image"}}
+{"timestamp":"2026-09-10T01:00:12Z","type":"response_item","payload":{ "type":"future_native_variant", "native_object":{"keep":true}, "native_array":[1,2,3]}}

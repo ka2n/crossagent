@@ -1,280 +1,160 @@
-// Package transcript normalizes the append-only JSONL transcripts written by
-// coding agents. It contains no indexing or persistence policy; callers decide
-// which files and offsets to retain.
+// Package transcript reads the append-only JSONL transcripts written by
+// coding agents. It preserves source bytes and exposes vendor structure without
+// applying search, visibility, redaction, or persistence policy.
 package transcript
 
 import (
-	"bufio"
 	"bytes"
-	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"os"
-	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/ka2n/crossagent/agent"
 )
 
-// State carries transcript header metadata into later records.
+// State carries transcript-level metadata into subsequent source lines.
 type State struct {
 	SessionID string
 	Cwd       string
 }
 
-// Record is one searchable conversation or tool event. Data contains only the
-// visible vendor event represented by the record.
-type Record struct {
-	Agent     agent.Name      `json:"agent"`
-	SessionID string          `json:"session_id"`
-	Cwd       string          `json:"cwd"`
-	Offset    int64           `json:"offset"`
-	Index     int             `json:"index"`
-	Timestamp time.Time       `json:"timestamp"`
-	Role      string          `json:"role"`
-	Kind      string          `json:"kind"`
-	Content   string          `json:"content"`
-	NativeID  string          `json:"native_id,omitempty"`
-	Metadata  map[string]any  `json:"metadata,omitempty"`
-	Data      json.RawMessage `json:"data,omitempty"`
+// Entry is one complete, newline-terminated source line. Raw is an owned,
+// byte-for-byte copy of that line, including its line ending. ParseLine also
+// accepts data without a line ending and preserves exactly what it receives.
+// Raw is deliberately excluded from JSON marshaling: source bytes are not a
+// JSON value and must be stored or transmitted explicitly when required.
+type Entry struct {
+	Agent     agent.Name `json:"agent"`
+	Offset    int64      `json:"offset"`
+	Raw       []byte     `json:"-"`
+	Timestamp time.Time  `json:"timestamp"`
+	SessionID string     `json:"session_id,omitempty"`
+	Cwd       string     `json:"cwd,omitempty"`
+	Envelope  Envelope   `json:"envelope"`
+	Blocks    []Block    `json:"blocks,omitempty"`
 }
 
-// ParseLine updates state and converts one JSONL line. It returns no records
-// for headers, reasoning, token accounting, and other internal events.
-func ParseLine(name agent.Name, line []byte, state *State) ([]Record, error) {
-	if state == nil {
-		return nil, errors.New("transcript: nil state")
-	}
-	line = bytes.TrimSpace(line)
-	if len(line) == 0 {
-		return nil, nil
-	}
-	if len(line) > MaxLineBytes {
-		return nil, ErrLineTooLong
-	}
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(line, &raw); err != nil {
-		return nil, fmt.Errorf("transcript: decode %s line: %w", name, err)
-	}
-	var records []Record
-	switch name {
-	case agent.Claude:
-		records = parseClaude(raw, state)
-	case agent.Codex:
-		records = parseCodex(raw, state)
-	case agent.Pi:
-		records = parsePi(raw, state)
-	default:
-		return nil, fmt.Errorf("transcript: unsupported agent %q", name)
-	}
-	for i := range records {
-		records[i].Agent, records[i].SessionID, records[i].Cwd = name, state.SessionID, state.Cwd
-		records[i].Index = i
-	}
-	return records, nil
+// RawCopy returns a caller-owned copy of the exact source-line bytes.
+func (e Entry) RawCopy() []byte { return cloneBytes(e.Raw) }
+
+// Envelope is common metadata from the vendor's outer object. Type and
+// Subtype retain native names; they are not mapped to a common event taxonomy.
+// Fields contains every native top-level field as its original JSON value.
+type Envelope struct {
+	Type      string                     `json:"type,omitempty"`
+	Subtype   string                     `json:"subtype,omitempty"`
+	Role      string                     `json:"role,omitempty"`
+	ID        string                     `json:"id,omitempty"`
+	ParentID  string                     `json:"parent_id,omitempty"`
+	RequestID string                     `json:"request_id,omitempty"`
+	Model     string                     `json:"model,omitempty"`
+	Provider  string                     `json:"provider,omitempty"`
+	Fields    map[string]json.RawMessage `json:"fields"`
 }
+
+// Block is an ordered, content-bearing vendor structure. Type is the native
+// block or payload type. Raw is an owned, byte-exact copy of the complete
+// native block and is deliberately excluded from JSON marshaling. Arguments
+// and Content retain native JSON values as structural accessors; Text and
+// Signature are decoded strings. Path identifies the native field containing
+// the block.
+type Block struct {
+	Path      string          `json:"path,omitempty"`
+	Type      string          `json:"type,omitempty"`
+	Role      string          `json:"role,omitempty"`
+	ID        string          `json:"id,omitempty"`
+	CallID    string          `json:"call_id,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Status    string          `json:"status,omitempty"`
+	Text      string          `json:"text,omitempty"`
+	Signature string          `json:"signature,omitempty"`
+	Arguments json.RawMessage `json:"arguments,omitempty"`
+	Content   json.RawMessage `json:"content,omitempty"`
+	Raw       []byte          `json:"-"`
+}
+
+// RawCopy returns a caller-owned copy of the exact native block bytes.
+func (b Block) RawCopy() []byte { return cloneBytes(b.Raw) }
 
 const (
-	// MaxLineBytes bounds one vendor JSON object.
+	// MaxLineBytes bounds one complete source line, including its line ending.
 	MaxLineBytes = 16 << 20
-	// MaxBatchRecords bounds records delivered by one Stream or Read call.
-	MaxBatchRecords = 1000
-	// MaxBatchBytes bounds complete source bytes consumed by one Read call.
-	MaxBatchBytes = 64 << 20
 )
 
 var ErrLineTooLong = errors.New("transcript: JSONL line exceeds 16 MiB")
 
-// Batch is the result of reading complete JSONL records from an offset.
-type Batch struct {
-	Records []Record
-	Cursor  Cursor
-	// NextOffset mirrors Cursor.Offset for callers that only display progress.
-	NextOffset   int64
-	Partial      bool
-	Truncated    bool
-	LimitReached bool
-	State        State
-}
-
-// Cursor identifies both a byte position and the transcript generation whose
-// header was observed there.
+// Cursor identifies a byte position and the transcript generation whose first
+// source line was observed. Offset always points to a source-line boundary.
 type Cursor struct {
 	Offset      int64
 	Fingerprint string
+	// RecordIndex is retained so persisted pre-lossless cursors still decode.
+	// Deprecated: entries are now acknowledged by source line. NewReader ignores
+	// this value and may redeliver the one line named by an old cursor.
 	RecordIndex int
 }
 
-// LineError reports a complete bad line that callers may quarantine. Retrying
-// from Next.Offset continues at the following line.
+// LineError identifies a complete malformed or oversized line that callers
+// may quarantine. Next is already positioned at the following source line.
+// Raw is populated for malformed JSON. Oversized lines are not retained in
+// memory; Offset and Length identify their source byte range.
 type LineError struct {
-	Next Cursor
-	Err  error
+	Offset int64
+	Length int64
+	Raw    []byte `json:"-"`
+	Next   Cursor
+	Err    error
 }
 
 func (e *LineError) Error() string { return e.Err.Error() }
 func (e *LineError) Unwrap() error { return e.Err }
 
-// Status describes where a transcript read stopped.
-type Status struct {
-	Cursor       Cursor
-	State        State
-	Partial      bool
-	Truncated    bool
-	LimitReached bool
-	Records      int
-}
-
-// StreamStatus is a descriptive alias for Stream callers.
-type StreamStatus = Status
-
-// Stream synchronously delivers records with natural callback backpressure.
-// Its cursor advances after each successful callback; RecordIndex permits an
-// interrupted multi-record line to resume without redelivering accepted data.
-func Stream(ctx context.Context, name agent.Name, path string, cursor Cursor, state State, yield func(Record) error) (StreamStatus, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if yield == nil {
-		return StreamStatus{}, errors.New("transcript: nil stream callback")
-	}
-	if cursor.Offset < 0 {
-		return StreamStatus{}, errors.New("transcript: negative offset")
-	}
-	if cursor.RecordIndex < 0 {
-		return StreamStatus{}, errors.New("transcript: negative record index")
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return StreamStatus{}, err
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return StreamStatus{}, err
-	}
-	fingerprint, err := headerFingerprint(f)
-	if err != nil {
-		return StreamStatus{}, err
-	}
-	truncated := cursor.Offset > info.Size() || cursor.Fingerprint != "" && cursor.Fingerprint != fingerprint
-	if truncated {
-		cursor.Offset, cursor.RecordIndex, state = 0, 0, State{}
-	}
-	cursor.Fingerprint = fingerprint
-	if _, err := f.Seek(cursor.Offset, io.SeekStart); err != nil {
-		return StreamStatus{}, err
-	}
-	startOffset := cursor.Offset
-	status := StreamStatus{Cursor: cursor, State: state, Truncated: truncated}
-	r := bufio.NewReaderSize(f, 64*1024)
-	for {
-		if status.Records >= MaxBatchRecords || status.Cursor.Offset-startOffset >= MaxBatchBytes {
-			status.LimitReached = true
-			return status, nil
-		}
-		if err := ctx.Err(); err != nil {
-			return status, err
-		}
-		line, consumed, hasData, readErr := readLine(r)
-		if errors.Is(readErr, io.EOF) {
-			status.Partial = hasData
-			return status, nil
-		}
-		if errors.Is(readErr, ErrLineTooLong) {
-			next := Cursor{Offset: status.Cursor.Offset + consumed, Fingerprint: fingerprint}
-			return status, &LineError{Next: next, Err: readErr}
-		}
-		if readErr != nil {
-			return status, readErr
-		}
-		if status.Cursor.Offset-startOffset+int64(len(line)) > MaxBatchBytes {
-			status.LimitReached = true
-			return status, nil
-		}
-		records, err := ParseLine(name, line, &status.State)
-		if err != nil {
-			next := Cursor{Offset: status.Cursor.Offset + int64(len(line)), Fingerprint: fingerprint}
-			return status, &LineError{Next: next, Err: err}
-		}
-		if status.Cursor.RecordIndex > len(records) {
-			return status, errors.New("transcript: cursor record index exceeds line records")
-		}
-		for i := range records {
-			records[i].Offset = status.Cursor.Offset
-		}
-		for i := status.Cursor.RecordIndex; i < len(records); i++ {
-			if status.Records >= MaxBatchRecords {
-				status.LimitReached = true
-				return status, nil
-			}
-			if err := yield(records[i]); err != nil {
-				return status, err
-			}
-			status.Records++
-			status.Cursor.RecordIndex = i + 1
-		}
-		status.Cursor.Offset += int64(len(line))
-		status.Cursor.RecordIndex = 0
-	}
-}
-
-// Read is a bounded convenience wrapper around Stream.
-func Read(ctx context.Context, name agent.Name, path string, cursor Cursor, state State) (Batch, error) {
-	batch := Batch{}
-	status, err := Stream(ctx, name, path, cursor, state, func(record Record) error {
-		batch.Records = append(batch.Records, record)
+// RawCopy returns a caller-owned copy of the malformed source-line bytes.
+func (e *LineError) RawCopy() []byte {
+	if e == nil {
 		return nil
-	})
-	batch.Cursor = status.Cursor
-	batch.NextOffset = status.Cursor.Offset
-	batch.Partial = status.Partial
-	batch.Truncated = status.Truncated
-	batch.LimitReached = status.LimitReached
-	batch.State = status.State
-	return batch, err
+	}
+	return cloneBytes(e.Raw)
 }
 
-func readLine(r *bufio.Reader) ([]byte, int64, bool, error) {
-	var line []byte
-	var consumed int64
-	tooLong := false
-	for {
-		part, err := r.ReadSlice('\n')
-		consumed += int64(len(part))
-		if !tooLong && len(line)+len(part) > MaxLineBytes {
-			line, tooLong = nil, true
-		} else if !tooLong {
-			line = append(line, part...)
-		}
-		if errors.Is(err, bufio.ErrBufferFull) {
-			continue
-		}
-		if tooLong && err == nil {
-			return nil, consumed, true, ErrLineTooLong
-		}
-		return line, consumed, consumed > 0, err
-	}
+// Status reports the acknowledged checkpoint and terminal file flags.
+type Status struct {
+	Cursor    Cursor
+	State     State
+	Partial   bool
+	Truncated bool
 }
 
-func headerFingerprint(f *os.File) (string, error) {
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return "", err
+// ParseLine parses one source line and updates transcript state. It never
+// filters an entry or reconstructs its Raw bytes. Vendor fields with unknown
+// shapes remain available through Entry.Raw and Block.Raw.
+func ParseLine(name agent.Name, line []byte, state *State) (Entry, error) {
+	if state == nil {
+		return Entry{}, errors.New("transcript: nil state")
 	}
-	line, _, _, err := readLine(bufio.NewReaderSize(f, 64*1024))
-	if err != nil && !errors.Is(err, io.EOF) {
-		return "", err
+	if name != agent.Claude && name != agent.Codex && name != agent.Pi {
+		return Entry{}, fmt.Errorf("transcript: unsupported agent %q", name)
 	}
-	return fingerprintLine(line), nil
-}
+	if len(line) > MaxLineBytes {
+		return Entry{}, ErrLineTooLong
+	}
 
-func fingerprintLine(line []byte) string {
-	sum := sha256.Sum256(bytes.TrimSpace(line))
-	return fmt.Sprintf("%x", sum)
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(line, &raw); err != nil {
+		return Entry{}, fmt.Errorf("transcript: decode %s line: %w", name, err)
+	}
+	entry := Entry{Agent: name, Raw: cloneBytes(line)}
+	switch name {
+	case agent.Claude:
+		parseClaude(raw, state, &entry)
+	case agent.Codex:
+		parseCodex(raw, state, &entry)
+	case agent.Pi:
+		parsePi(raw, state, &entry)
+	}
+	entry.SessionID, entry.Cwd = state.SessionID, state.Cwd
+	return entry, nil
 }
 
 func parseTime(raw json.RawMessage) time.Time {
@@ -296,50 +176,71 @@ func text(raw json.RawMessage) string {
 	return value
 }
 
-func contentText(raw json.RawMessage) string {
-	var direct string
-	if json.Unmarshal(raw, &direct) == nil {
-		return direct
-	}
-	var blocks []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
-	if json.Unmarshal(raw, &blocks) != nil {
-		return ""
-	}
-	var parts []string
-	for _, block := range blocks {
-		if block.Type == "text" || block.Type == "input_text" || block.Type == "output_text" {
-			if value := strings.TrimSpace(block.Text); value != "" {
-				parts = append(parts, value)
-			}
+func first(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
 		}
 	}
-	return strings.Join(parts, "\n")
+	return ""
 }
 
-func concise(value string) string {
-	value = strings.TrimSpace(value)
-	const limit = 4096
-	if len(value) > limit {
-		return conciseBytes(value, limit) + "…"
+func firstRaw(values ...json.RawMessage) json.RawMessage {
+	for _, value := range values {
+		if len(value) != 0 && !bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return cloneRaw(value)
+		}
 	}
-	return value
+	return nil
 }
 
-func conciseBytes(value string, limit int) string {
-	if len(value) <= limit {
-		return value
-	}
-	value = value[:limit]
-	for !utf8.ValidString(value) {
-		value = value[:len(value)-1]
-	}
-	return value
+func cloneRaw(raw []byte) json.RawMessage {
+	return append(json.RawMessage(nil), raw...)
 }
 
-func visibleData(value any) json.RawMessage {
-	data, _ := json.Marshal(value)
-	return data
+func cloneBytes(raw []byte) []byte {
+	return append([]byte(nil), raw...)
+}
+
+type blockDefaults struct {
+	role      string
+	id        string
+	name      string
+	signature string
+}
+
+func contentBlocks(raw json.RawMessage, path, fallbackType string, defaults blockDefaults) []Block {
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil
+	}
+	var items []json.RawMessage
+	if json.Unmarshal(raw, &items) == nil {
+		blocks := make([]Block, 0, len(items))
+		for _, item := range items {
+			blocks = append(blocks, nativeBlock(item, path, fallbackType, defaults))
+		}
+		return blocks
+	}
+	return []Block{nativeBlock(raw, path, fallbackType, defaults)}
+}
+
+func nativeBlock(raw json.RawMessage, path, fallbackType string, defaults blockDefaults) Block {
+	block := Block{Path: path, Type: fallbackType, Role: defaults.role, ID: defaults.id, Name: defaults.name, Signature: defaults.signature, Raw: cloneBytes(raw)}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil {
+		block.Text = text(raw)
+		block.Content = cloneRaw(raw)
+		return block
+	}
+	block.Type = first(text(fields["type"]), fallbackType)
+	block.Role = first(text(fields["role"]), defaults.role)
+	block.CallID = first(text(fields["call_id"]), text(fields["toolCallId"]), text(fields["tool_use_id"]), defaults.id)
+	block.ID = first(text(fields["id"]), block.CallID, defaults.id)
+	block.Name = first(text(fields["name"]), text(fields["toolName"]), defaults.name)
+	block.Status = text(fields["status"])
+	block.Text = first(text(fields["text"]), text(fields["thinking"]), text(fields["message"]), text(fields["query"]), text(fields["summary"]))
+	block.Signature = first(text(fields["signature"]), text(fields["thinkingSignature"]), text(fields["encrypted_content"]), defaults.signature)
+	block.Arguments = firstRaw(fields["arguments"], fields["input"], fields["action"], fields["command"])
+	block.Content = firstRaw(fields["content"], fields["output"], fields["result"], fields["tools"], fields["aggregated_output"])
+	return block
 }

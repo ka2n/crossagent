@@ -1,0 +1,7 @@
+{"type":"session","version":3,"id":"pi-fixture","timestamp":"2026-09-10T00:00:00Z","cwd":"/work/pi"}
+{"type":"model_change","id":"model-1","parentId":null,"timestamp":"2026-09-10T00:00:01Z","provider":"anthropic","modelId":"claude-sonnet"}
+{"type":"message","id":"assistant-1","parentId":"model-1","timestamp":"2026-09-10T00:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"reply"}],"provider":"anthropic","model":"claude-sonnet"}}
+{"type":"message","id":"bash-1","parentId":"assistant-1","timestamp":"2026-09-10T00:00:03Z","message":{ "role":"bashExecution", "command":"printf 'raw output'", "output":"raw output\n", "exitCode":0, "cancelled":false, "truncated":false}}
+{"type":"compaction","id":"compact-1","parentId":"bash-1","timestamp":"2026-09-10T00:00:04Z","summary":"exact compaction summary","tokensBefore":50000,"retainedTail":[ {"role":"user","content":"latest request"}, {"role":"assistant","content":[ {"type":"text","text":"latest reply"} ],"provider":"anthropic","model":"claude-sonnet"} ]}
+{"type":"branch_summary","id":"branch-1","parentId":"compact-1","timestamp":"2026-09-10T00:00:05Z","fromId":"assistant-1","summary":"alternate branch summary"}
+{"type":"custom_message","id":"custom-1","parentId":"branch-1","timestamp":"2026-09-10T00:00:06Z","customType":"fixture-extension","content":[ {"type":"text","text":"extension context"}, {"type":"image","data":"AAEC","mimeType":"image/png"} ],"display":false}

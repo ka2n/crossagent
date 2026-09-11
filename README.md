@@ -10,7 +10,7 @@ It covers four fact-oriented capabilities:
    filesystem discovery.
 3. **Normalize and manage** hook events, payload fields, output channels,
    async semantics, and safe declarative configuration changes.
-4. **Read and normalize** append-only Claude Code, Codex, and pi transcript JSONL.
+4. **Read losslessly and structurally parse** append-only Claude Code, Codex, and pi transcript JSONL.
 
 The path and hook packages provide the facts needed for session-location
 discovery and safe hook configuration management. Hook configuration changes
@@ -125,13 +125,17 @@ encoders are one-way because their on-disk keys are lossy. Codex transcript
 paths include a timestamp, so the resolver returns a search pattern unless the
 start time is known.
 
-## Transcript records
+## Lossless transcript entries
 
-`crossagent/transcript` turns Claude Code, Codex, and pi session JSONL into a
-small common record. Headers update a caller-owned `State`; conversation and tool
-events produce records; reasoning, token usage, and other internal events are
-ignored. `Record.Data` contains a sanitized visible message or tool event for
-consumers that need structured fields.
+`crossagent/transcript` reads Claude Code, Codex, and pi session JSONL one source
+line at a time. Every complete JSON line becomes exactly one `Entry`, including
+headers, reasoning, token accounting, progress, and unknown vendor events.
+`Entry.Raw` is an owned `[]byte`, byte-for-byte identical including the original
+`\n` or `\r\n`; `RawCopy` returns a separate caller-owned copy. Raw source bytes
+are deliberately excluded from `encoding/json` output (`json:"-"`) because
+marshaling a JSONL line as a JSON value cannot promise a byte round trip. Store
+or transmit `Raw` explicitly when exact bytes are required. The package does
+not summarize, redact, sanitize, or choose what is searchable.
 
 ```go
 import (
@@ -150,14 +154,19 @@ if err != nil {
 defer reader.Close()
 
 for {
-    record, err := reader.Next()
+    entry, err := reader.Next()
     if errors.Is(err, io.EOF) {
         break
+    }
+    var lineErr *transcript.LineError
+    if errors.As(err, &lineErr) {
+        quarantine(path, lineErr.Offset, lineErr.Length)
+        continue // the reader is already at lineErr.Next
     }
     if err != nil {
         return err
     }
-    if err := index(record); err != nil {
+    if err := consume(entry); err != nil {
         return err
     }
     if err := reader.Ack(); err != nil {
@@ -167,26 +176,48 @@ for {
 cursor, state = reader.Cursor(), reader.State()
 ```
 
-`Cursor.Offset` advances only past newline-terminated records. If an agent is
-still writing the final JSON object, `Partial` is true and the same bytes are
-retried on the next read. If the saved offset is beyond the current file size
-or its header fingerprint changes, `Truncated` is true and reading restarts
-with empty state. Reads are bounded to
-16 MiB per line, 1,000 records and 64 MiB of source data per batch.
+`Entry` adds parsed `Timestamp`, inherited `SessionID` and `Cwd`, native
+`Envelope` names and identifiers, every top-level field in `Envelope.Fields`,
+and ordered `Blocks`. Block types retain vendor spellings (`tool_use`,
+`function_call`, `toolCall`, and so on). Each
+block keeps its native byte-exact `Raw []byte` (also excluded from JSON
+marshaling) plus native JSON values for `Arguments` and `Content`; decoded
+thinking text and signatures are exposed without removing them from the raw
+source. `Block.RawCopy` returns an independent copy. Consumers, not crossagent,
+decide visibility, normalization, indexing, and retention policy. `ParseLine`
+exposes the same structural parser to callers that already own traversal.
 
-`ParseLine` is also public for applications that already own file traversal
-and byte cursors. It returns zero or more records because a pi assistant message
-may contain visible text and several tool calls. `Record.Data` is reconstructed
-from the visible message or tool block; thinking text, signatures and unrelated
-vendor metadata are not included.
+`Next` does not advance the acknowledged `Cursor` or `State`; after accepting
+an entry, call `Ack`. Closing or failing before `Ack` deterministically
+redelivers that source line after reopen. A final line without a newline is
+reported by `io.EOF` with `Partial` true and is retried from the same offset.
+Malformed complete lines return `LineError` with their exact bytes. Oversized
+lines are not retained in memory, but `LineError.Offset` and `Length` identify
+the range to quarantine. In both cases the recoverable cursor advances to the
+following line. The per-line limit is 16 MiB.
 
-`Reader.Next` pulls one record at a time without accumulating the transcript.
-After the consumer accepts a record it calls `Ack`; until then `Cursor` and
-`State` remain at the previous checkpoint, and another `Next` returns
-`ErrUnackedRecord`. `Cursor.RecordIndex` resumes inside a pi or Claude line that
-produced several records without redelivering acknowledged records. `NewReader`
-accepts an `io.ReadSeeker` without taking ownership for tests and embedded uses.
-`Stream` and `Read` remain bounded convenience wrappers.
+A cursor also carries the legacy fdfc880 fingerprint (SHA-256 of the trimmed
+first source line). Existing persisted fingerprints therefore remain valid. If
+the cursor offset is past the current file size or the fingerprint changes,
+`Truncated` is true and the reader restarts at offset zero with empty state.
+`Cursor.RecordIndex` remains only as a deprecated migration field: the
+source-line reader ignores and clears it, and may redeliver the containing line
+from an old multi-record cursor rather than risk skipping bytes. `Open` owns and
+closes its file; `NewReader` borrows an `io.ReadSeeker`. Context cancellation is
+checked before and while reading source-line chunks. A nonterminal source read
+error restores the acknowledged seek position and buffer before returning; if
+that restoration fails, subsequent reads return `ErrReaderUnusable`.
+
+### Transcript API migration (v0)
+
+This lossless API intentionally breaks the earlier normalized transcript API:
+`Record`, `Batch`, `Read`, and `Stream` were replaced by one source-line `Entry`
+and the pull-based `Reader`; `ParseLine` now returns one `Entry`; and search
+normalization, filtering, summaries, truncation, and sanitization were removed.
+The module remains at v0 and the only known consumer is jill, so this is a
+documented v0 migration rather than a new major module. Consumers should derive
+searchable records and visibility policy downstream from `Envelope`, `Blocks`,
+and ultimately `Raw`.
 
 ## Hook facts
 
