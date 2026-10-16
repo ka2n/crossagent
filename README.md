@@ -3,7 +3,7 @@
 `crossagent` is a small, dependency-free Go library for tooling that spans
 Claude Code, Codex, and pi.
 
-It covers four fact-oriented capabilities:
+It covers five fact-oriented capabilities:
 
 1. **Detect** installed agents and their versions.
 2. **Resolve** session, transcript, and configuration locations without
@@ -11,6 +11,7 @@ It covers four fact-oriented capabilities:
 3. **Normalize and manage** hook events, payload fields, output channels,
    async semantics, and safe declarative configuration changes.
 4. **Read losslessly and structurally parse** append-only Claude Code, Codex, and pi transcript JSONL.
+5. **Observe** hook-time working directory, Git worktree, branch, HEAD, and optional terminal title.
 
 The path and hook packages provide the facts needed for session-location
 discovery and safe hook configuration management. Hook configuration changes
@@ -309,3 +310,28 @@ the ownership suffix belongs only to the configured shell command.
 
 The library uses only the Go standard library and `go.mod` has no third-party
 dependencies. It is intended to build with `CGO_ENABLED=0`.
+
+## Hook-time session context
+
+`sessioncontext.Collect(ctx, cwd, sessioncontext.Options{})` returns a best-effort
+`Snapshot` containing `cwd`, `observed_at`, and optional `git` and `terminal`
+objects. Git facts include `worktree_root`, `branch`, `head`, and `detached`.
+Collection uses the supplied directory, including subdirectories and linked
+worktrees; an empty directory disables Git probing. Inherited `GIT_*`
+environment variables are removed from Git subprocesses so hook environment
+overrides cannot redirect repository discovery. Unborn branches have no HEAD;
+non-Git directories have no Git object.
+
+Terminal titles are collected only when `HERDR_ENV=1`, `HERDR_PANE_ID` is set,
+and `herdr` is available. The collector reads `herdr pane current --current`
+and prefers `terminal_title_stripped`. Set `Options.SessionID` (and optionally
+`Agent`) to require a matching pane agent identity: a missing or mismatched
+identity omits the title, preventing child sessions from inheriting a parent's
+pane title. Without an expected identity the current pane title is accepted.
+Herdr is optional and no focus, wake-up, or delivery action is performed.
+
+Commands share a 500ms default deadline, configurable with `Options.Timeout`.
+Failures preserve whatever facts were successfully collected. `Options` also
+provides injectable environment lookup, executable lookup, command runner, and
+clock functions. These are last-observed facts, not a guarantee of current
+branch, process liveness, role, or delivery availability.
