@@ -335,3 +335,18 @@ Failures preserve whatever facts were successfully collected. `Options` also
 provides injectable environment lookup, executable lookup, command runner, and
 clock functions. These are last-observed facts, not a guarantee of current
 branch, process liveness, role, or delivery availability.
+
+### Current process session
+
+`processcontext.Resolve(processcontext.Options{})` identifies the coding-agent
+session hosting a child process, independently of hook payloads or transcripts.
+It returns the agent, session ID and source. `Getenv` is injectable for callers
+that capture environments or for tests.
+
+Native sources are `CODEX_THREAD_ID` and `CLAUDE_CODE_SESSION_ID`. Integrations
+such as a Pi extension can export `CROSSAGENT_AGENT` and
+`CROSSAGENT_SESSION_ID` together. All available sources must agree; missing,
+incomplete and conflicting inherited context returns an error. A launcher for
+nested hosts must provide a consistent child environment; this API never guesses
+which parent identity to ignore. Identity does not prove mailbox registration,
+notification delivery, or process liveness.
